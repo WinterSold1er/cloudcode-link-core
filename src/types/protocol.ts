@@ -75,9 +75,9 @@ export interface FinishReason {
 }
 
 export type StreamChunk =
-  | { type: 'text-delta'; text: string; index?: number }
-  | { type: 'reasoning-delta'; text: string; index?: number }
-  | { type: 'tool-call-delta'; id: CallId; name?: string; argumentsDelta?: string; index?: number }
+  | { type: 'text-delta'; text: string; index: number }
+  | { type: 'reasoning-delta'; text: string; index: number }
+  | { type: 'tool-call-delta'; id: CallId; name?: string; argumentsDelta?: string; index: number }
   | { type: 'block-start'; index: number; blockType: string }
   | { type: 'block-end'; index: number; block?: ContentBlock }
   | { type: 'usage'; usage: TokenUsage }

@@ -96,7 +96,7 @@ function extractToolResultText(blocks: unknown): string {
  * Maps conversation messages into Google CloudCode GeminiContent turns.
  */
 export async function convertMessages(
-  messages: Message[],
+  messages: any[],
   readImage?: ImageReader,
   runtimeModel = 'gemini-3.7-flash',
 ): Promise<GeminiContent[]> {

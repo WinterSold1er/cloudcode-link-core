@@ -130,7 +130,7 @@ export function normalizeCustomToolSchema(schema: unknown): unknown {
  * Claude and GPT-OSS use parameters with allowlist.
  */
 export function convertTools(
-  tools: ToolSchema[] | undefined,
+  tools: any[] | undefined,
   useLegacyParameters = false,
 ): { functionDeclarations: GeminiFunctionDeclaration[] }[] | undefined {
   if (!tools || tools.length === 0) return undefined
