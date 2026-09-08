@@ -2,7 +2,7 @@ import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
 import { mkdtempSync, statSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { tmpdir, homedir } from 'node:os'
 import { join } from 'node:path'
 import { AgyAdapter } from '../src/adapter.ts'
 import { ModelCatalog } from '../src/models.ts'
@@ -10,7 +10,6 @@ import { AccountPoolManager, defaultPoolDir } from '../src/pool.ts'
 import { SessionStore } from '../src/sessions.ts'
 import { convertMessages, sanitizeTopology } from '../src/message-converter.ts'
 import { QuotaService } from '../src/quota.ts'
-import { dshHome } from '../src/pool.ts'
 import { defaultConfig } from '../src/types/config-types.ts'
 import type { Message } from '../src/index.ts'
 
@@ -421,24 +420,28 @@ describe('Comprehensive Remediation Verification: 8 Issues', () => {
   // Issue 8: Canonical Base Directory Resolution
   // --------------------------------------------------------------------------
   describe('Issue 8: Canonical Base Directory Resolution', () => {
-    it('dshHome honors DSH_HOME and DSH_STATE_DIR, and defaultPoolDir aligns', () => {
-      const origHome = process.env.DSH_HOME
-      const origState = process.env.DSH_STATE_DIR
+    it('defaultPoolDir honors customBase > CLOUDCODE_ACCOUNTS_DIR > ANTIGRAVITY_ACCOUNTS_DIR > fallback', () => {
+      const origCloud = process.env.CLOUDCODE_ACCOUNTS_DIR
+      const origAgy = process.env.ANTIGRAVITY_ACCOUNTS_DIR
 
       try {
-        delete process.env.DSH_HOME
-        process.env.DSH_STATE_DIR = '/custom/dsh/state'
-        assert.equal(dshHome(), '/custom/dsh/state')
-        assert.equal(defaultPoolDir(), '/custom/dsh/state/agy-accounts')
+        delete process.env.CLOUDCODE_ACCOUNTS_DIR
+        delete process.env.ANTIGRAVITY_ACCOUNTS_DIR
+        assert.equal(defaultPoolDir(), join(homedir(), '.cloudcode', 'accounts'))
+        assert.equal(defaultPoolDir('/explicit/base'), '/explicit/base')
 
-        process.env.DSH_HOME = '/priority/dsh/home'
-        assert.equal(dshHome(), '/priority/dsh/home')
-        assert.equal(defaultPoolDir(), '/priority/dsh/home/agy-accounts')
+        process.env.ANTIGRAVITY_ACCOUNTS_DIR = '/custom/antigravity/dir'
+        assert.equal(defaultPoolDir(), '/custom/antigravity/dir')
+        assert.equal(defaultPoolDir('/explicit/base'), '/explicit/base')
+
+        process.env.CLOUDCODE_ACCOUNTS_DIR = '/custom/cloudcode/dir'
+        assert.equal(defaultPoolDir(), '/custom/cloudcode/dir')
+        assert.equal(defaultPoolDir('/explicit/base'), '/explicit/base')
       } finally {
-        if (origHome !== undefined) process.env.DSH_HOME = origHome
-        else delete process.env.DSH_HOME
-        if (origState !== undefined) process.env.DSH_STATE_DIR = origState
-        else delete process.env.DSH_STATE_DIR
+        if (origCloud !== undefined) process.env.CLOUDCODE_ACCOUNTS_DIR = origCloud
+        else delete process.env.CLOUDCODE_ACCOUNTS_DIR
+        if (origAgy !== undefined) process.env.ANTIGRAVITY_ACCOUNTS_DIR = origAgy
+        else delete process.env.ANTIGRAVITY_ACCOUNTS_DIR
       }
     })
   })

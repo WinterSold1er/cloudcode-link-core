@@ -46,6 +46,11 @@ export class SessionStore {
 
   constructor(file: string) {
     this.file = file
+    const dir = dirname(file)
+    try {
+      mkdirSync(dir, { recursive: true, mode: 0o700 })
+      chmodSync(dir, 0o700)
+    } catch {}
     this.load()
   }
 
@@ -164,10 +169,14 @@ export class SessionStore {
   /** Atomic write: tmp file + rename. */
   private persist(): void {
     try {
-      mkdirSync(dirname(this.file), { recursive: true })
+      const dir = dirname(this.file)
+      mkdirSync(dir, { recursive: true, mode: 0o700 })
+      try {
+        chmodSync(dir, 0o700)
+      } catch {}
       const randomSuffix = Math.random().toString(36).slice(2)
       const tmp = join(
-        dirname(this.file),
+        dir,
         `.${require$$basename(this.file)}.tmp.${process.pid}.${Date.now()}.${randomSuffix}`,
       )
       writeFileSync(tmp, JSON.stringify(this.data, null, 2), { encoding: 'utf8', mode: 0o600 })

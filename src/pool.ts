@@ -15,15 +15,11 @@ import {
 } from './types/pool-types.ts'
 import { parseResetDurationMs } from './types/config-types.ts'
 
-export function dshHome(): string {
-  return process.env.DSH_HOME ?? process.env.DSH_STATE_DIR ?? join(homedir(), '.dsh')
-}
-
 export function defaultPoolDir(customBase?: string): string {
   if (customBase) return customBase
   if (process.env.CLOUDCODE_ACCOUNTS_DIR?.trim()) return process.env.CLOUDCODE_ACCOUNTS_DIR.trim()
   if (process.env.ANTIGRAVITY_ACCOUNTS_DIR?.trim()) return process.env.ANTIGRAVITY_ACCOUNTS_DIR.trim()
-  return join(dshHome(), 'agy-accounts')
+  return join(homedir(), '.cloudcode', 'accounts')
 }
 
 export class Semaphore {
@@ -91,14 +87,20 @@ export class AccountPoolManager {
       }
       throw new Error('Missing or invalid accounts array')
     } catch (err: unknown) {
-      const corruptBackup = `${this.file}.corrupted.${Date.now()}`
+      const corruptBackup = `${this.file}.corrupted`
       try {
+        if (existsSync(corruptBackup)) {
+          rmSync(corruptBackup, { force: true })
+        }
         renameSync(this.file, corruptBackup)
       } catch {
-        // Best-effort backup
+        try {
+          renameSync(this.file, `${this.file}.corrupted.${Date.now()}`)
+        } catch {}
       }
-      const msg = err instanceof Error ? err.message : String(err)
-      throw new Error(`Failed to load account pool from ${this.file}: ${msg}. Corrupted file backed up to ${corruptBackup}`)
+      const empty = defaultPoolData()
+      this.data = empty
+      return empty
     }
   }
 
@@ -208,9 +210,13 @@ export class AccountPoolManager {
   createStagingSlot(): { id: string; dir: string } {
     const id = `acc_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
     const dir = join(this.baseDir, `staging_${id}`)
-    mkdirSync(join(dir, '.gemini', 'antigravity-cli'), { recursive: true })
+    const geminiDir = join(dir, '.gemini')
+    const tokenDir = join(geminiDir, 'antigravity-cli')
+    mkdirSync(tokenDir, { recursive: true, mode: 0o700 })
     try {
       chmodSync(dir, 0o700)
+      chmodSync(geminiDir, 0o700)
+      chmodSync(tokenDir, 0o700)
     } catch {}
     return { id, dir }
   }
@@ -312,9 +318,13 @@ export class AccountPoolManager {
   createAccountSlot(alias?: string): ManagedAccount {
     const id = `acc_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
     const dir = join(this.baseDir, id)
-    mkdirSync(join(dir, '.gemini', 'antigravity-cli'), { recursive: true })
+    const geminiDir = join(dir, '.gemini')
+    const tokenDir = join(geminiDir, 'antigravity-cli')
+    mkdirSync(tokenDir, { recursive: true, mode: 0o700 })
     try {
       chmodSync(dir, 0o700)
+      chmodSync(geminiDir, 0o700)
+      chmodSync(tokenDir, 0o700)
     } catch {}
 
     const count = this.data.accounts.length + 1

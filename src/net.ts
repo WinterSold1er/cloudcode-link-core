@@ -16,12 +16,23 @@ function agentFor(proxyUrl?: string): EnvHttpProxyAgent | ProxyAgent {
   return envAgent
 }
 
+export interface AgyFetchOptions extends RequestInit {
+  timeoutMs?: number | null
+}
+
 /** fetch() honoring env proxies, or an explicit per-account proxy URL. */
-export function agyFetch(url: string, init: RequestInit = {}, proxyUrl?: string): Promise<Response> {
-  const signal = init.signal ?? AbortSignal.timeout(30_000)
+export function agyFetch(url: string, init: AgyFetchOptions = {}, proxyUrl?: string): Promise<Response> {
+  let signal: AbortSignal | undefined = init.signal ?? undefined
+  if (!signal && init.timeoutMs !== null && init.timeoutMs !== 0) {
+    const isStream = url.includes('streamGenerateContent')
+    const timeout = init.timeoutMs ?? (isStream ? 0 : 30_000)
+    if (timeout > 0) {
+      signal = AbortSignal.timeout(timeout)
+    }
+  }
   return undiciFetch(url, {
     ...(init as object),
-    signal,
+    ...(signal ? { signal } : {}),
     dispatcher: agentFor(proxyUrl),
   }) as unknown as Promise<Response>
 }

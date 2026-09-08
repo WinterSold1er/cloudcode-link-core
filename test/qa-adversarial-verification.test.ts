@@ -12,7 +12,6 @@ import { AgyAdapter } from '../src/adapter.ts'
 import { ModelCatalog } from '../src/models.ts'
 import { AccountPoolManager, defaultPoolDir } from '../src/pool.ts'
 import { QuotaService } from '../src/quota.ts'
-import { dshHome } from '../src/pool.ts'
 import { defaultConfig } from '../src/types/config-types.ts'
 import type { GenerateOptions, Message, StreamChunk } from '../src/index.ts'
 
@@ -21,24 +20,22 @@ describe('QA Adversarial Verification Suite: Boundary, Failure Paths & Externali
   // Group 1: Configuration Externalization & Environment Isolation
   // ==========================================================================
   describe('Group 1: Configuration Externalization & Non-Functional Resilience', () => {
-    it('C1: DSH_HOME & DSH_STATE_DIR dynamic override correctly directs persistence path and permissions', () => {
-      const origHome = process.env.DSH_HOME
-      const origState = process.env.DSH_STATE_DIR
+    it('C1: CLOUDCODE_ACCOUNTS_DIR & ANTIGRAVITY_ACCOUNTS_DIR dynamic override correctly directs persistence path and permissions', () => {
+      const origCloud = process.env.CLOUDCODE_ACCOUNTS_DIR
+      const origAgy = process.env.ANTIGRAVITY_ACCOUNTS_DIR
 
-      const tempDirA = mkdtempSync(join(tmpdir(), 'qa-dsh-home-'))
-      const tempDirB = mkdtempSync(join(tmpdir(), 'qa-dsh-state-'))
+      const tempDirA = mkdtempSync(join(tmpdir(), 'qa-cloudcode-dir-'))
+      const tempDirB = mkdtempSync(join(tmpdir(), 'qa-antigravity-dir-'))
 
       try {
-        // Priority test: DSH_HOME takes precedence
-        process.env.DSH_HOME = tempDirA
-        process.env.DSH_STATE_DIR = tempDirB
-        assert.equal(dshHome(), tempDirA, 'DSH_HOME must have highest precedence')
-        assert.equal(defaultPoolDir(), join(tempDirA, 'agy-accounts'))
+        // Priority test: CLOUDCODE_ACCOUNTS_DIR takes precedence
+        process.env.CLOUDCODE_ACCOUNTS_DIR = tempDirA
+        process.env.ANTIGRAVITY_ACCOUNTS_DIR = tempDirB
+        assert.equal(defaultPoolDir(), tempDirA, 'CLOUDCODE_ACCOUNTS_DIR must have highest precedence')
 
-        // Fallback test: DSH_STATE_DIR takes over when DSH_HOME is absent
-        delete process.env.DSH_HOME
-        assert.equal(dshHome(), tempDirB, 'DSH_STATE_DIR must take over when DSH_HOME is missing')
-        assert.equal(defaultPoolDir(), join(tempDirB, 'agy-accounts'))
+        // Fallback test: ANTIGRAVITY_ACCOUNTS_DIR takes over when CLOUDCODE_ACCOUNTS_DIR is absent
+        delete process.env.CLOUDCODE_ACCOUNTS_DIR
+        assert.equal(defaultPoolDir(), tempDirB, 'ANTIGRAVITY_ACCOUNTS_DIR must take over when CLOUDCODE_ACCOUNTS_DIR is missing')
 
         // AccountPoolManager bootstraps securely in externalized dir
         const pool = new AccountPoolManager(defaultPoolDir())
@@ -48,10 +45,10 @@ describe('QA Adversarial Verification Suite: Boundary, Failure Paths & Externali
         const poolJsonStat = statSync(join(defaultPoolDir(), 'pool.json'))
         assert.equal(poolJsonStat.mode & 0o666, 0o600, 'pool.json file must be strictly 0o600')
       } finally {
-        if (origHome !== undefined) process.env.DSH_HOME = origHome
-        else delete process.env.DSH_HOME
-        if (origState !== undefined) process.env.DSH_STATE_DIR = origState
-        else delete process.env.DSH_STATE_DIR
+        if (origCloud !== undefined) process.env.CLOUDCODE_ACCOUNTS_DIR = origCloud
+        else delete process.env.CLOUDCODE_ACCOUNTS_DIR
+        if (origAgy !== undefined) process.env.ANTIGRAVITY_ACCOUNTS_DIR = origAgy
+        else delete process.env.ANTIGRAVITY_ACCOUNTS_DIR
         rmSync(tempDirA, { recursive: true, force: true })
         rmSync(tempDirB, { recursive: true, force: true })
       }

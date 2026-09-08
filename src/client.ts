@@ -467,6 +467,7 @@ export async function streamGenerateContent(
         headers,
         body,
         signal,
+        timeoutMs: null,
       }, proxyUrl)
 
       if (res.ok) {

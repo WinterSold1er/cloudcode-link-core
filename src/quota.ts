@@ -208,7 +208,13 @@ export class QuotaService {
     this.pool.setMemoryToken(account.id, tokens.access_token, tokens.expiryMs)
     const file = this.getTokenFilePath(account)
     try {
-      mkdirSync(dirname(file), { recursive: true })
+      const dir = dirname(file)
+      const geminiDir = dirname(dir)
+      mkdirSync(dir, { recursive: true, mode: 0o700 })
+      try {
+        chmodSync(geminiDir, 0o700)
+        chmodSync(dir, 0o700)
+      } catch {}
       let raw: Record<string, unknown> = {}
       if (existsSync(file)) {
         try {

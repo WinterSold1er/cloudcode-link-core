@@ -150,8 +150,14 @@ export async function fetchUserEmail(accessToken: string, proxyUrl?: string): Pr
  *   {"token": {access_token, token_type, refresh_token, expiry}, "auth_method": "consumer"}
  */
 export function writeAgyTokenFile(homeDir: string, tokens: TokenSet): string {
-  const dir = join(homeDir, '.gemini', 'antigravity-cli')
-  mkdirSync(dir, { recursive: true })
+  const geminiDir = join(homeDir, '.gemini')
+  const dir = join(geminiDir, 'antigravity-cli')
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  try {
+    chmodSync(homeDir, 0o700)
+    chmodSync(geminiDir, 0o700)
+    chmodSync(dir, 0o700)
+  } catch {}
   const file = join(dir, 'antigravity-oauth-token')
   const expiryIso = tokens.expiryMs
     ? formatLocalIso(tokens.expiryMs)
