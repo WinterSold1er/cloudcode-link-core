@@ -158,9 +158,9 @@ export async function convertMessages(
             }
           }
         } else if (block.type === 'tool_result' || block.type === 'tool-result') {
-          const tr = block as unknown as { id?: string; toolCallId?: string; result?: unknown; content?: unknown; isError?: boolean }
+          const tr = block as unknown as { id?: string; toolCallId?: string; toolName?: string; result?: unknown; content?: unknown; isError?: boolean }
           const callId = tr.id || tr.toolCallId || ''
-          const toolName = toolNameByCallId.get(callId) || 'tool'
+          const toolName = tr.toolName || toolNameByCallId.get(callId) || 'tool'
           const rawContent = tr.content ?? tr.result
           const resultText = extractToolResultText(rawContent)
           const resp = tr.isError
@@ -200,12 +200,27 @@ export async function convertMessages(
     } else if (msg.role === 'assistant') {
       const parts: GeminiPart[] = []
       const blocks = typeof msg.content === 'string' ? [{ type: 'text', text: msg.content }] : (msg.content || [])
+
+      let turnThoughtSignature: string | undefined
+      for (const b of blocks) {
+        const sig =
+          (b as unknown as { thoughtSignature?: string; thought_signature?: string }).thoughtSignature ||
+          (b as unknown as { thoughtSignature?: string; thought_signature?: string }).thought_signature ||
+          (b as unknown as { textSignature?: string }).textSignature ||
+          (b as unknown as { thinkingSignature?: string }).thinkingSignature
+        if (isValidThoughtSignature(sig)) {
+          turnThoughtSignature = sig
+          break
+        }
+      }
+
       for (const block of blocks) {
         if (block.type === 'text') {
           const text = (block as TextBlock).text
           const sig =
             (block as unknown as { thoughtSignature?: string; thought_signature?: string }).thoughtSignature ||
-            (block as unknown as { thoughtSignature?: string; thought_signature?: string }).thought_signature
+            (block as unknown as { thoughtSignature?: string; thought_signature?: string }).thought_signature ||
+            (block as unknown as { textSignature?: string }).textSignature
           if (text) {
             parts.push({
               text: sanitizeText(text),
@@ -216,7 +231,8 @@ export async function convertMessages(
           const reasoning = (block as ReasoningBlock).text
           const sig =
             (block as unknown as { thoughtSignature?: string; thought_signature?: string }).thoughtSignature ||
-            (block as unknown as { thoughtSignature?: string; thought_signature?: string }).thought_signature
+            (block as unknown as { thoughtSignature?: string; thought_signature?: string }).thought_signature ||
+            (block as unknown as { thinkingSignature?: string }).thinkingSignature
           if (reasoning) {
             if (isValidThoughtSignature(sig)) {
               parts.push({
@@ -230,7 +246,8 @@ export async function convertMessages(
           const tc = block as unknown as { id?: string; name: string; arguments: unknown }
           const sig =
             (block as unknown as { thoughtSignature?: string; thought_signature?: string }).thoughtSignature ||
-            (block as unknown as { thoughtSignature?: string; thought_signature?: string }).thought_signature
+            (block as unknown as { thoughtSignature?: string; thought_signature?: string }).thought_signature ||
+            turnThoughtSignature
           const functionCall: GeminiFunctionCallPart['functionCall'] = {
             name: tc.name,
             args: parseJsonArguments(tc.arguments),

@@ -127,6 +127,7 @@ export async function* mapSseStreamToChunks(
   let lastFinishReason: string | undefined
   let hasToolCalls = false
   let firstChunkEmitted = false
+  let lastSeenThoughtSignature: string | undefined
 
   const notifyFirstEmit = () => {
     if (!firstChunkEmitted) {
@@ -228,6 +229,9 @@ export async function* mapSseStreamToChunks(
             const isThought = part.thought === true
             const blockType = isThought ? 'reasoning' : 'text'
             const sig = part.thoughtSignature || part.thought_signature
+            if (sig) {
+              lastSeenThoughtSignature = sig
+            }
 
             if (!currentBlock || currentBlock.type !== blockType) {
               const end = closeCurrentBlock()
@@ -251,9 +255,19 @@ export async function* mapSseStreamToChunks(
             }
             notifyFirstEmit()
             if (isThought) {
-              yield { type: 'reasoning-delta', index: active.index, text: part.text }
+              yield {
+                type: 'reasoning-delta',
+                index: active.index,
+                text: part.text,
+                ...(sig ? { thoughtSignature: sig } : {}),
+              }
             } else {
-              yield { type: 'text-delta', index: active.index, text: part.text }
+              yield {
+                type: 'text-delta',
+                index: active.index,
+                text: part.text,
+                ...(sig ? { thoughtSignature: sig } : {}),
+              }
             }
           }
 
@@ -269,11 +283,15 @@ export async function* mapSseStreamToChunks(
               `call_${Date.now()}_${++toolCallGen}`
             const name = part.functionCall.name || 'tool'
             const fullArgs = JSON.stringify(part.functionCall.args || {})
-            const sig =
+            const rawSig =
               part.thoughtSignature ||
               part.thought_signature ||
               part.functionCall.thoughtSignature ||
               part.functionCall.thought_signature
+            if (rawSig) {
+              lastSeenThoughtSignature = rawSig
+            }
+            const sig = rawSig || lastSeenThoughtSignature
 
             notifyFirstEmit()
             yield { type: 'block-start', index: idx, blockType: 'tool-call' }
@@ -285,6 +303,7 @@ export async function* mapSseStreamToChunks(
               id: rawId as CallId,
               name,
               argumentsDelta: fullArgs,
+              ...(sig ? { thoughtSignature: sig } : {}),
             }
 
             yield {
@@ -376,10 +395,14 @@ export class BlockAssembler {
       if (chunk.name && !b.name) b.name = chunk.name
       if (chunk.id && !b.id) b.id = chunk.id
       if (chunk.argumentsDelta) b.arguments += chunk.argumentsDelta
+      if (chunk.thoughtSignature && !b.thoughtSignature) b.thoughtSignature = chunk.thoughtSignature
     } else if (chunk.type === 'block-end') {
       const existing = this._activeBlocks.get(chunk.index)
       const finalBlock = chunk.block ?? existing
       if (finalBlock) {
+        if (existing && !finalBlock.thoughtSignature && existing.thoughtSignature) {
+          finalBlock.thoughtSignature = existing.thoughtSignature
+        }
         this._blocks.push(finalBlock)
         this._activeBlocks.delete(chunk.index)
       }
