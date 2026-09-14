@@ -7,6 +7,7 @@ import type {
   SessionMetricFilter,
   StatsConfig,
 } from '../types.ts'
+import { isSqliteAvailable, SqliteStatsStorage } from './sqlite.ts'
 
 export class MemoryStatsStorage implements IStatsStorage {
   private requests: RequestMetric[] = []
@@ -169,5 +170,21 @@ export function createStatsStorage(config: StatsConfig): IStatsStorage {
   if (dbPath === ':memory:' || dbPath.startsWith('memory://')) {
     return new MemoryStatsStorage()
   }
-  throw new Error(`Unsupported dbPath protocol: "${config.dbPath}". Only "memory://" or ":memory:" is currently supported by default storage factory.`)
+
+  // Reject unsupported remote protocols
+  if (dbPath.includes('://') && !dbPath.startsWith('sqlite://') && !dbPath.startsWith('file://')) {
+    throw new Error(
+      `Unsupported dbPath protocol: "${config.dbPath}". Only "memory://", ":memory:", or local SQLite files are currently supported by default storage factory.`,
+    )
+  }
+
+  // If node:sqlite is available, use SqliteStatsStorage for local/sqlite files
+  if (isSqliteAvailable()) {
+    return new SqliteStatsStorage(dbPath)
+  }
+
+  console.warn(
+    `[cloudcode-link-core] node:sqlite is not available in current runtime. Falling back to MemoryStatsStorage for path "${config.dbPath}".`,
+  )
+  return new MemoryStatsStorage()
 }

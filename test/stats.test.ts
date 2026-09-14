@@ -1,8 +1,14 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { mkdtempSync, rmSync, existsSync, statSync } from 'node:fs'
 import {
   StatsCollector,
   MemoryStatsStorage,
+  SqliteStatsStorage,
+  createStatsStorage,
+  isSqliteAvailable,
   type StatsConfig,
   type RequestMetric,
   type IStatsStorage,
@@ -822,4 +828,173 @@ test('Issue 9: queryRequests and querySessions return records sorted in descendi
   assert.equal(sortedSessions[1]?.sessionId, 'sess-mid') // 2000
 
   await storage.close()
+})
+
+test('SqliteStatsStorage: createStatsStorage instantiates SqliteStatsStorage and persists data across instances', async () => {
+  if (!isSqliteAvailable()) {
+    return
+  }
+
+  const testDir = mkdtempSync(join(tmpdir(), 'core-sqlite-test-'))
+  const dbFile = join(testDir, 'cloudcode-stats.sqlite')
+
+  try {
+    const storage1 = createStatsStorage({ ...validConfig, dbPath: dbFile })
+    assert.ok(storage1 instanceof SqliteStatsStorage)
+    if (process.platform !== 'win32') {
+      const mode = statSync(dbFile).mode & 0o777
+      assert.strictEqual(mode, 0o600)
+    }
+    await storage1.init()
+
+    await storage1.saveRequestMetrics([
+      {
+        requestId: 'req-sqlite-1',
+        sessionId: 'sess-sqlite-1',
+        accountId: 'acc-1',
+        model: 'gemini-3.8-flash',
+        timestamp: 1000,
+        status: 'success',
+        latencyMs: 120,
+        cacheHit: true,
+        promptTokens: 100,
+        cachedTokens: 60,
+        outputTokens: 20,
+      },
+    ])
+
+    await storage1.upsertSessionDeltas?.([
+      {
+        sessionId: 'sess-sqlite-1',
+        accountId: 'acc-1',
+        createdAt: 1000,
+        updatedAt: 1000,
+        requestCount: 1,
+        successCount: 1,
+        failedCount: 0,
+        promptTokens: 100,
+        cachedTokens: 60,
+        outputTokens: 20,
+      },
+    ])
+
+    const sessionBeforeClose = await storage1.getSessionMetric('sess-sqlite-1')
+    assert.ok(sessionBeforeClose)
+    assert.equal(sessionBeforeClose.totalRequests, 1)
+    assert.equal(sessionBeforeClose.cacheHitRate, 0.6)
+
+    await storage1.close()
+
+    // Open second instance pointing to the exact same sqlite file
+    const storage2 = createStatsStorage({ ...validConfig, dbPath: dbFile })
+    assert.ok(storage2 instanceof SqliteStatsStorage)
+    await storage2.init()
+
+    const reqs = await storage2.queryRequests?.({ sessionId: 'sess-sqlite-1' })
+    assert.equal(reqs?.length, 1)
+    assert.equal(reqs?.[0]?.requestId, 'req-sqlite-1')
+    assert.equal(reqs?.[0]?.cacheHit, true)
+    assert.equal(reqs?.[0]?.latencyMs, 120)
+
+    const sessionAfterReopen = await storage2.getSessionMetric('sess-sqlite-1')
+    assert.ok(sessionAfterReopen)
+    assert.equal(sessionAfterReopen.totalRequests, 1)
+    assert.equal(sessionAfterReopen.cacheHitRate, 0.6)
+
+    // Verify accumulation of deltas
+    await storage2.upsertSessionDeltas?.([
+      {
+        sessionId: 'sess-sqlite-1',
+        accountId: 'acc-1',
+        createdAt: 900,
+        updatedAt: 1500,
+        requestCount: 1,
+        successCount: 1,
+        failedCount: 0,
+        promptTokens: 100,
+        cachedTokens: 20,
+        outputTokens: 30,
+      },
+    ])
+
+    const sessionAccumulated = await storage2.getSessionMetric('sess-sqlite-1')
+    assert.ok(sessionAccumulated)
+    assert.equal(sessionAccumulated.totalRequests, 2)
+    assert.equal(sessionAccumulated.createdAt, 900)
+    assert.equal(sessionAccumulated.updatedAt, 1500)
+    assert.equal(sessionAccumulated.totalPromptTokens, 200)
+    assert.equal(sessionAccumulated.totalCachedTokens, 80)
+    assert.equal(sessionAccumulated.cacheHitRate, 0.4)
+
+    // Test retention deletion
+    const deletedReqs = await storage2.deleteRequestsBefore(1200)
+    assert.equal(deletedReqs, 1)
+    const reqsAfterDel = await storage2.queryRequests?.({ sessionId: 'sess-sqlite-1' })
+    assert.equal(reqsAfterDel?.length, 0)
+
+    const deletedSess = await storage2.deleteSessionsBefore(1000)
+    assert.equal(deletedSess, 0) // updatedAt is 1500
+    const deletedSess2 = await storage2.deleteSessionsBefore(2000)
+    assert.equal(deletedSess2, 1)
+    const sessAfterDel = await storage2.getSessionMetric('sess-sqlite-1')
+    assert.equal(sessAfterDel, null)
+
+    await storage2.close()
+  } finally {
+    if (existsSync(testDir)) {
+      rmSync(testDir, { recursive: true, force: true })
+    }
+  }
+})
+
+test('StatsCollector: end-to-end with persistent sqlite database path', async () => {
+  if (!isSqliteAvailable()) {
+    return
+  }
+
+  const testDir = mkdtempSync(join(tmpdir(), 'core-collector-sqlite-'))
+  const dbFile = join(testDir, 'collector-stats.sqlite')
+
+  try {
+    const collector = new StatsCollector({
+      ...validConfig,
+      dbPath: dbFile,
+      flushIntervalMs: 50,
+    })
+
+    collector.start()
+
+    collector.recordRequest({
+      requestId: 'req-c-1',
+      sessionId: 'sess-c-1',
+      accountId: 'acc-1',
+      model: 'gemini-3.8-flash',
+      status: 'success',
+      latencyMs: 80,
+      promptTokens: 200,
+      cachedTokens: 100,
+      outputTokens: 50,
+    })
+
+    await collector.flush()
+
+    const session = await collector.getSessionMetric('sess-c-1')
+    assert.ok(session)
+    assert.equal(session.totalRequests, 1)
+    assert.equal(session.totalPromptTokens, 200)
+    assert.equal(session.totalCachedTokens, 100)
+    assert.equal(session.cacheHitRate, 0.5)
+
+    const storage = collector.getStorage()
+    assert.ok(storage instanceof SqliteStatsStorage)
+    const reqs = await storage.queryRequests?.({ sessionId: 'sess-c-1' })
+    assert.equal(reqs?.length, 1)
+    assert.equal(reqs?.[0]?.requestId, 'req-c-1')
+
+    await collector.close()
+  } finally {
+    if (existsSync(testDir)) {
+      rmSync(testDir, { recursive: true, force: true })
+    }
+  }
 })
