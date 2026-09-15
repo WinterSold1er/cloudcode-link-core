@@ -170,7 +170,7 @@ test('Quota-Aware Selection: undefined quota treated as 1.0 (full)', () => {
   assert.equal(pool.selectAccount('google')?.id, accB.id)
 })
 
-test('Quota-Aware Selection: equal fraction preserves list order', () => {
+test('Quota-Aware Selection: equal fraction rotates in round-robin order', () => {
   const dir = mkdtempSync(join(tmpdir(), 'agy-pool-quota-eq-'))
   const pool = new AccountPoolManager(dir)
   pool.setMode('round-robin')
@@ -178,12 +178,15 @@ test('Quota-Aware Selection: equal fraction preserves list order', () => {
   const accB = pool.createAccountSlot('Account B')
   const accC = pool.createAccountSlot('Account C')
 
-  // All same fraction
-  pool.updateAccountQuotas(accA.id, { google: { remainingFraction: 0.5 } })
-  pool.updateAccountQuotas(accB.id, { google: { remainingFraction: 0.5 } })
-  pool.updateAccountQuotas(accC.id, { google: { remainingFraction: 0.5 } })
+  // All same fraction (e.g. all 100% or all 50%)
+  pool.updateAccountQuotas(accA.id, { google: { remainingFraction: 1.0 } })
+  pool.updateAccountQuotas(accB.id, { google: { remainingFraction: 1.0 } })
+  pool.updateAccountQuotas(accC.id, { google: { remainingFraction: 1.0 } })
 
-  // Should pick first in list order: accA
+  // Should rotate through accounts in round-robin sequence
+  assert.equal(pool.selectAccount('google')?.id, accA.id)
+  assert.equal(pool.selectAccount('google')?.id, accB.id)
+  assert.equal(pool.selectAccount('google')?.id, accC.id)
   assert.equal(pool.selectAccount('google')?.id, accA.id)
 })
 

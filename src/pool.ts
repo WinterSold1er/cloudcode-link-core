@@ -639,14 +639,26 @@ export class AccountPoolManager {
       return pinned
     }
 
-    // Round-robin: Quota-Aware Selection — pick account with highest 5H remaining quota
+    // Round-robin: Quota-Aware Selection — pick account with highest 5H remaining quota,
+    // rotate in round-robin order when quotas are equal (e.g. all accounts at 100%).
     if (this.data.mode === 'round-robin' && candidates.length > 1) {
+      const activeId = this.runtimeActiveAccountIds.get(family) ?? this.data.activeAccountIds?.[family]
+      const lastIndex = activeId ? this.data.accounts.findIndex((a) => a.id === activeId) : -1
+      const total = this.data.accounts.length
+
       const sorted = candidates.slice().sort((a, b) => {
         const aFrac = a.quotas[family]?.remainingFraction ?? 1.0
         const bFrac = b.quotas[family]?.remainingFraction ?? 1.0
-        if (bFrac !== aFrac) return bFrac - aFrac  // descending: most remaining first
-        // equal fraction → preserve original list order (stable)
-        return candidates.indexOf(a) - candidates.indexOf(b)
+        if (Math.abs(bFrac - aFrac) >= 0.001) {
+          return bFrac - aFrac // descending: most remaining first
+        }
+
+        // Equal fraction: rotate in circular order after the last active account
+        const aIndex = this.data.accounts.indexOf(a)
+        const bIndex = this.data.accounts.indexOf(b)
+        const aDist = lastIndex !== -1 ? (aIndex - lastIndex - 1 + total) % total : aIndex
+        const bDist = lastIndex !== -1 ? (bIndex - lastIndex - 1 + total) % total : bIndex
+        return aDist - bDist
       })
       const chosen = sorted[0]!
       this.runtimeActiveAccountIds.set(family, chosen.id)
