@@ -129,6 +129,88 @@ test('Sequential Drain: family-scoped rate limit fallback', () => {
   assert.equal(pool.selectAccount('anthropic')?.id, accA.id)
 })
 
+test('Quota-Aware Selection: picks account with highest remainingFraction', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agy-pool-quota-'))
+  const pool = new AccountPoolManager(dir)
+  pool.setMode('round-robin')
+  const accA = pool.getAccounts()[0]!
+  const accB = pool.createAccountSlot('Account B')
+  const accC = pool.createAccountSlot('Account C')
+
+  // Set different quota fractions
+  pool.updateAccountQuotas(accA.id, { google: { remainingFraction: 0.2 } })
+  pool.updateAccountQuotas(accB.id, { google: { remainingFraction: 0.8 } })
+  pool.updateAccountQuotas(accC.id, { google: { remainingFraction: 0.5 } })
+
+  // Should pick Account B (highest remaining: 0.8)
+  assert.equal(pool.selectAccount('google')?.id, accB.id)
+
+  // Reduce B's quota below C
+  pool.updateAccountQuotas(accB.id, { google: { remainingFraction: 0.3 } })
+
+  // Now C has highest (0.5)
+  assert.equal(pool.selectAccount('google')?.id, accC.id)
+
+  // Set A highest
+  pool.updateAccountQuotas(accA.id, { google: { remainingFraction: 0.9 } })
+  assert.equal(pool.selectAccount('google')?.id, accA.id)
+})
+
+test('Quota-Aware Selection: undefined quota treated as 1.0 (full)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agy-pool-quota-undef-'))
+  const pool = new AccountPoolManager(dir)
+  pool.setMode('round-robin')
+  const accA = pool.getAccounts()[0]!
+  const accB = pool.createAccountSlot('Account B')
+
+  // Only accA has quota data; accB has none (treated as 1.0)
+  pool.updateAccountQuotas(accA.id, { google: { remainingFraction: 0.5 } })
+
+  // accB should be picked (implicit 1.0 > 0.5)
+  assert.equal(pool.selectAccount('google')?.id, accB.id)
+})
+
+test('Quota-Aware Selection: equal fraction preserves list order', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agy-pool-quota-eq-'))
+  const pool = new AccountPoolManager(dir)
+  pool.setMode('round-robin')
+  const accA = pool.getAccounts()[0]!
+  const accB = pool.createAccountSlot('Account B')
+  const accC = pool.createAccountSlot('Account C')
+
+  // All same fraction
+  pool.updateAccountQuotas(accA.id, { google: { remainingFraction: 0.5 } })
+  pool.updateAccountQuotas(accB.id, { google: { remainingFraction: 0.5 } })
+  pool.updateAccountQuotas(accC.id, { google: { remainingFraction: 0.5 } })
+
+  // Should pick first in list order: accA
+  assert.equal(pool.selectAccount('google')?.id, accA.id)
+})
+
+test('Quota-Aware Selection: cooldown account skipped, picks next highest quota', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agy-pool-quota-cd-'))
+  const pool = new AccountPoolManager(dir)
+  pool.setMode('round-robin')
+  const accA = pool.getAccounts()[0]!
+  const accB = pool.createAccountSlot('Account B')
+
+  pool.updateAccountQuotas(accA.id, { google: { remainingFraction: 0.9 } })
+  pool.updateAccountQuotas(accB.id, { google: { remainingFraction: 0.3 } })
+
+  // accA is best
+  assert.equal(pool.selectAccount('google')?.id, accA.id)
+
+  // accA hits 429 → cooldown
+  pool.recordFailure(accA.id, 'google', '429 Rate Limit')
+
+  // accB is the only healthy candidate
+  assert.equal(pool.selectAccount('google')?.id, accB.id)
+
+  // Clear cooldown → accA back with higher quota
+  pool.clearCooldown(accA.id, 'google')
+  assert.equal(pool.selectAccount('google')?.id, accA.id)
+})
+
 test('Sticky Sequential Drain: stays on current active account until it runs out', () => {
   const dir = mkdtempSync(join(tmpdir(), 'agy-pool-sticky-'))
   const pool = new AccountPoolManager(dir)
@@ -136,27 +218,27 @@ test('Sticky Sequential Drain: stays on current active account until it runs out
   const accB = pool.createAccountSlot('Account B')
   const accC = pool.createAccountSlot('Account C')
 
-  // 1. Initial request picks Account A
+  // Sequential drain starts with Account A
   assert.equal(pool.selectAccount('google')?.id, accA.id)
 
-  // 2. Account A runs out of quota (hits 429) -> failover to Account B
+  // Account A gets 429, falls to B
   pool.recordFailure(accA.id, 'google', '429 Rate Limit')
   assert.equal(pool.selectAccount('google')?.id, accB.id)
 
-  // 3. User continues chatting with Account B
+  // Keeps selecting B (sticky)
   assert.equal(pool.selectAccount('google')?.id, accB.id)
 
-  // 4. Now Account A recovers its quota / cooldown expires!
+  // Even if A's cooldown expires, B stays active (sticky)
   pool.clearCooldown(accA.id, 'google')
 
-  // 5. CRITICAL: Account B is still healthy and in-use, so it MUST stay on Account B!
+  // Still on B
   assert.equal(pool.selectAccount('google')?.id, accB.id)
 
-  // 6. Only when Account B runs out of quota does it move to Account C
+  // B gets 429, falls to C
   pool.recordFailure(accB.id, 'google', '429 Rate Limit')
   assert.equal(pool.selectAccount('google')?.id, accC.id)
 
-  // 7. When Account C also runs out, and A is recovered, it wraps back to Account A
+  // C gets 429, wraps around to A (which is now clear)
   pool.recordFailure(accC.id, 'google', '429 Rate Limit')
   assert.equal(pool.selectAccount('google')?.id, accA.id)
 })

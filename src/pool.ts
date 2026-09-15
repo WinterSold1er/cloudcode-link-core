@@ -625,16 +625,21 @@ export class AccountPoolManager {
       return pinned
     }
 
+    // Round-robin: Quota-Aware Selection — pick account with highest 5H remaining quota
     if (this.data.mode === 'round-robin' && candidates.length > 1) {
-      const sorted = candidates.slice().sort((a, b) => (a.lastUsedAt ?? 0) - (b.lastUsedAt ?? 0))
-      const chosen = sorted[0] ?? null
-      if (chosen) {
-        this.runtimeActiveAccountIds.set(family, chosen.id)
-      }
+      const sorted = candidates.slice().sort((a, b) => {
+        const aFrac = a.quotas[family]?.remainingFraction ?? 1.0
+        const bFrac = b.quotas[family]?.remainingFraction ?? 1.0
+        if (bFrac !== aFrac) return bFrac - aFrac  // descending: most remaining first
+        // equal fraction → preserve original list order (stable)
+        return candidates.indexOf(a) - candidates.indexOf(b)
+      })
+      const chosen = sorted[0]!
+      this.runtimeActiveAccountIds.set(family, chosen.id)
       return chosen
     }
 
-    // Default 'sequential' (Sticky Sequential Drain):
+    // Default 'sequential' (Sticky Sequential Drain): — 恢复原始逻辑
     const activeId = this.runtimeActiveAccountIds.get(family) ?? this.data.activeAccountIds?.[family]
     if (activeId) {
       const activeCandidate = candidates.find((a) => a.id === activeId)
