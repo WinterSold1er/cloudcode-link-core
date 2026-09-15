@@ -8,6 +8,7 @@ export interface RequestMetric {
   timestamp: number
   status: RequestMetricStatus
   latencyMs: number
+  ttftMs?: number
   cacheHit: boolean
   promptTokens: number
   cachedTokens: number
@@ -48,6 +49,7 @@ export interface RecordRequestInput {
   timestamp?: number
   status: RequestMetricStatus
   latencyMs: number
+  ttftMs?: number
   promptTokens: number
   cachedTokens: number
   outputTokens: number
@@ -87,12 +89,87 @@ export interface StatsCollectorOptions {
 export interface RequestMetricFilter {
   sessionId?: string
   accountId?: string
+  status?: RequestMetricStatus
   limit?: number
+  offset?: number
+  since?: number
+  until?: number
 }
 
 export interface SessionMetricFilter {
   accountId?: string
   limit?: number
+  offset?: number
+}
+
+export interface StatsOverviewAccount {
+  accountId: string
+  totalRequests: number
+  successRequests: number
+  failedRequests: number
+  promptTokens: number
+  cachedTokens: number
+  outputTokens: number
+  cacheHitRate: number
+  avgLatencyMs: number
+}
+
+export interface StatsOverview {
+  totalRequests: number
+  totalSuccess: number
+  totalFailed: number
+  totalAbort: number
+  totalTokens: number
+  totalPromptTokens: number
+  totalCachedTokens: number
+  totalOutputTokens: number
+  cacheHitRate: number
+  avgLatencyMs: number
+  avgTtftMs: number
+  p50LatencyMs: number
+  p90LatencyMs: number
+}
+
+export interface OverviewMetricsResult {
+  overview: StatsOverview
+  accounts: StatsOverviewAccount[]
+}
+
+export interface AccountUsageMetric {
+  accountId: string
+  totalRequests: number
+  successRequests: number
+  failedRequests: number
+  promptTokens: number
+  cachedTokens: number
+  outputTokens: number
+  totalLatencyMs: number
+  lastUsed: number | null
+}
+
+export interface AggregatedBucketMetric {
+  bucket: number
+  requests: number
+  successCount: number
+  failedCount: number
+  promptTokens: number
+  cachedTokens: number
+  outputTokens: number
+  totalLatencyMs: number
+  totalTtftMs: number
+  ttftCount: number
+}
+
+export function maskEmail(email?: string): string {
+  if (!email || typeof email !== 'string') return ''
+  const atIdx = email.indexOf('@')
+  if (atIdx <= 0) return email
+  const user = email.slice(0, atIdx)
+  const domain = email.slice(atIdx)
+  if (user.length <= 2) {
+    return `${user[0]}***${domain}`
+  }
+  return `${user.slice(0, 2)}***${domain}`
 }
 
 export interface IStatsStorage {
@@ -106,4 +183,13 @@ export interface IStatsStorage {
   deleteSessionsBefore(cutoffTime: number): Promise<number>
   queryRequests?(filter?: RequestMetricFilter): Promise<RequestMetric[]>
   querySessions?(filter?: SessionMetricFilter): Promise<SessionMetric[]>
+  countRequests?(filter?: RequestMetricFilter): Promise<number>
+  getOverviewMetrics?(): Promise<OverviewMetricsResult>
+  getAccountUsage?(): Promise<AccountUsageMetric[]>
+  getAggregatedMetrics?(
+    intervalMs: number,
+    since?: number,
+    until?: number,
+    limit?: number,
+  ): Promise<AggregatedBucketMetric[]>
 }

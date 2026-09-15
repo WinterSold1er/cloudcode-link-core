@@ -56,9 +56,13 @@ export class AccountPoolManager {
   private readonly accountSemaphores = new Map<string, Semaphore>()
   private readonly runtimeActiveAccountIds = new Map<ModelFamily, string>()
   private writeQueue: Promise<void> = Promise.resolve()
+  private lowQuotaThreshold = 0.05
 
-  constructor(baseDir = defaultPoolDir()) {
+  constructor(baseDir = defaultPoolDir(), lowQuotaThreshold = 0.05) {
     this.baseDir = baseDir
+    this.lowQuotaThreshold = typeof lowQuotaThreshold === 'number' && Number.isFinite(lowQuotaThreshold) && lowQuotaThreshold >= 0 && lowQuotaThreshold <= 1
+      ? lowQuotaThreshold
+      : 0.05
     this.file = join(baseDir, 'pool.json')
     try {
       chmodSync(this.baseDir, 0o700)
@@ -70,6 +74,16 @@ export class AccountPoolManager {
 
   getBaseDir(): string {
     return this.baseDir
+  }
+
+  setLowQuotaThreshold(threshold: number): void {
+    if (typeof threshold === 'number' && Number.isFinite(threshold) && threshold >= 0 && threshold <= 1) {
+      this.lowQuotaThreshold = threshold
+    }
+  }
+
+  getLowQuotaThreshold(): number {
+    return this.lowQuotaThreshold
   }
 
   private load(): AccountPoolData {
@@ -592,13 +606,13 @@ export class AccountPoolManager {
     this.persist()
   }
 
-  isAccountHealthy(account: ManagedAccount, family: ModelFamily): boolean {
+  isAccountHealthy(account: ManagedAccount, family: ModelFamily, threshold = this.lowQuotaThreshold): boolean {
     if (!account.enabled || account.authRequired) return false
     const now = Date.now()
     const cd = account.cooldowns[family]
     if (cd && cd.cooldownUntil > now) return false
     const quota = account.quotas[family]
-    if (quota && typeof quota.remainingFraction === 'number' && quota.remainingFraction <= 0.02) {
+    if (quota && typeof quota.remainingFraction === 'number' && quota.remainingFraction <= threshold) {
       if (quota.resetTime) {
         const resetMs = Date.parse(quota.resetTime)
         if (!Number.isNaN(resetMs) && resetMs > now) return false
@@ -679,7 +693,7 @@ export class AccountPoolManager {
         accReset = Math.max(accReset ?? 0, cd.cooldownUntil)
       }
       const quota = acc.quotas[family]
-      if (quota && typeof quota.remainingFraction === 'number' && quota.remainingFraction <= 0.02) {
+      if (quota && typeof quota.remainingFraction === 'number' && quota.remainingFraction <= this.lowQuotaThreshold) {
         if (quota.resetTime) {
           const resetMs = Date.parse(quota.resetTime)
           if (!Number.isNaN(resetMs) && resetMs > now) {

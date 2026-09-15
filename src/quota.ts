@@ -392,7 +392,11 @@ export class QuotaService {
     return this.fetchAvailableModels(accessToken, candidate.proxyUrl)
   }
 
-  async refreshAccountQuota(account: ManagedAccount, force = false): Promise<Partial<Record<ModelFamily, FamilyQuotaInfo>> | null> {
+  async refreshAccountQuota(
+    account: ManagedAccount,
+    force = false,
+    options?: { lightweight?: boolean; summaryOnly?: boolean },
+  ): Promise<Partial<Record<ModelFamily, FamilyQuotaInfo>> | null> {
     const now = Date.now()
     if (!force && account.quotas) {
       const latestUpdate = Math.max(
@@ -414,7 +418,9 @@ export class QuotaService {
       return null
     }
 
-    if (force) {
+    const isLightweight = Boolean(options?.lightweight || options?.summaryOnly)
+
+    if (force && !isLightweight) {
       const info = await this.fetchUserInfo(accessToken, account.proxyUrl)
       if (info?.email) email = info.email
     }
@@ -423,12 +429,21 @@ export class QuotaService {
       this.pool.resetAccountIdentity(account.id, email)
     }
 
-    const [summary, discovered] = await Promise.all([
-      this.fetchQuotaSummary(accessToken, account.proxyUrl),
-      this.fetchAvailableModels(accessToken, account.proxyUrl),
-    ])
+    let summary: QuotaSummaryResponse | null = null
+    let discovered: DiscoveredModelsResponse | null = null
 
-    if (!email) {
+    if (options?.summaryOnly) {
+      summary = await this.fetchQuotaSummary(accessToken, account.proxyUrl)
+    } else {
+      const [sum, disc] = await Promise.all([
+        this.fetchQuotaSummary(accessToken, account.proxyUrl),
+        this.fetchAvailableModels(accessToken, account.proxyUrl),
+      ])
+      summary = sum
+      discovered = disc
+    }
+
+    if (!email && !isLightweight) {
       const info = await this.fetchUserInfo(accessToken, account.proxyUrl)
       if (info?.email) email = info.email
     }
@@ -530,8 +545,20 @@ export class QuotaService {
       }
     }
 
+    if (options?.summaryOnly && account.quotas) {
+      for (const fam of Object.keys(familyQuotas) as ModelFamily[]) {
+        if (familyQuotas[fam] && !familyQuotas[fam]!.models && account.quotas[fam]?.models) {
+          familyQuotas[fam]!.models = account.quotas[fam]!.models
+        }
+      }
+    }
+
     this.pool.updateAccountQuotas(account.id, familyQuotas, email)
     return familyQuotas
+  }
+
+  async refreshQuotaSummaryOnly(account: ManagedAccount): Promise<Partial<Record<ModelFamily, FamilyQuotaInfo>> | null> {
+    return this.refreshAccountQuota(account, true, { lightweight: true, summaryOnly: true })
   }
 
   async selfHealQuarantinedAccounts(): Promise<number> {

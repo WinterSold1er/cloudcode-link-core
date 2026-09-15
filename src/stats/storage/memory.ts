@@ -1,11 +1,15 @@
 import type {
+  AccountUsageMetric,
+  AggregatedBucketMetric,
   IStatsStorage,
+  OverviewMetricsResult,
   RequestMetric,
   RequestMetricFilter,
   SessionMetric,
   SessionMetricDelta,
   SessionMetricFilter,
   StatsConfig,
+  StatsOverviewAccount,
 } from '../types.ts'
 import { isSqliteAvailable, SqliteStatsStorage } from './sqlite.ts'
 
@@ -132,11 +136,45 @@ export class MemoryStatsStorage implements IStatsStorage {
     if (filter?.accountId) {
       result = result.filter((r) => r.accountId === filter.accountId)
     }
+    if (filter?.status) {
+      result = result.filter((r) => r.status === filter.status)
+    }
+    if (filter?.since !== undefined) {
+      result = result.filter((r) => r.timestamp >= filter.since!)
+    }
+    if (filter?.until !== undefined) {
+      result = result.filter((r) => r.timestamp <= filter.until!)
+    }
     result = [...result].sort((a, b) => b.timestamp - a.timestamp)
+    const offset = filter?.offset !== undefined && filter.offset >= 0 ? filter.offset : 0
+    if (offset > 0) {
+      result = result.slice(offset)
+    }
     if (filter?.limit !== undefined && filter.limit >= 0) {
       result = result.slice(0, filter.limit)
     }
     return result.map((r) => ({ ...r }))
+  }
+
+  async countRequests(filter?: RequestMetricFilter): Promise<number> {
+    this.assertNotClosed()
+    let result = this.requests
+    if (filter?.sessionId) {
+      result = result.filter((r) => r.sessionId === filter.sessionId)
+    }
+    if (filter?.accountId) {
+      result = result.filter((r) => r.accountId === filter.accountId)
+    }
+    if (filter?.status) {
+      result = result.filter((r) => r.status === filter.status)
+    }
+    if (filter?.since !== undefined) {
+      result = result.filter((r) => r.timestamp >= filter.since!)
+    }
+    if (filter?.until !== undefined) {
+      result = result.filter((r) => r.timestamp <= filter.until!)
+    }
+    return result.length
   }
 
   async querySessions(filter?: SessionMetricFilter): Promise<SessionMetric[]> {
@@ -150,6 +188,222 @@ export class MemoryStatsStorage implements IStatsStorage {
       list = list.slice(0, filter.limit)
     }
     return list.map((s) => ({ ...s }))
+  }
+
+  async getOverviewMetrics(): Promise<OverviewMetricsResult> {
+    this.assertNotClosed()
+    const emptyResult: OverviewMetricsResult = {
+      overview: {
+        totalRequests: 0,
+        totalSuccess: 0,
+        totalFailed: 0,
+        totalAbort: 0,
+        totalTokens: 0,
+        totalPromptTokens: 0,
+        totalCachedTokens: 0,
+        totalOutputTokens: 0,
+        cacheHitRate: 0,
+        avgLatencyMs: 0,
+        avgTtftMs: 0,
+        p50LatencyMs: 0,
+        p90LatencyMs: 0,
+      },
+      accounts: [],
+    }
+
+    if (this.requests.length === 0) {
+      return emptyResult
+    }
+
+    let totalSuccess = 0
+    let totalFailed = 0
+    let totalAbort = 0
+    let totalPromptTokens = 0
+    let totalCachedTokens = 0
+    let totalOutputTokens = 0
+    let totalLatencyMs = 0
+    let totalTtftMs = 0
+    let ttftCount = 0
+    const latencies: number[] = []
+
+    const accountMap = new Map<
+      string,
+      {
+        accountId: string
+        totalRequests: number
+        successRequests: number
+        failedRequests: number
+        promptTokens: number
+        cachedTokens: number
+        outputTokens: number
+        totalLatencyMs: number
+      }
+    >()
+
+    for (const r of this.requests) {
+      if (r.status === 'success') totalSuccess++
+      else if (r.status === 'abort') totalAbort++
+      else totalFailed++
+
+      totalPromptTokens += r.promptTokens
+      totalCachedTokens += r.cachedTokens
+      totalOutputTokens += r.outputTokens
+      totalLatencyMs += r.latencyMs
+      latencies.push(r.latencyMs)
+      if (typeof r.ttftMs === 'number') {
+        totalTtftMs += r.ttftMs
+        ttftCount++
+      }
+
+      let acc = accountMap.get(r.accountId)
+      if (!acc) {
+        acc = {
+          accountId: r.accountId,
+          totalRequests: 0,
+          successRequests: 0,
+          failedRequests: 0,
+          promptTokens: 0,
+          cachedTokens: 0,
+          outputTokens: 0,
+          totalLatencyMs: 0,
+        }
+        accountMap.set(r.accountId, acc)
+      }
+      acc.totalRequests++
+      if (r.status === 'success') acc.successRequests++
+      else acc.failedRequests++
+      acc.promptTokens += r.promptTokens
+      acc.cachedTokens += r.cachedTokens
+      acc.outputTokens += r.outputTokens
+      acc.totalLatencyMs += r.latencyMs
+    }
+
+    latencies.sort((a, b) => a - b)
+    const totalRequests = this.requests.length
+    const p50LatencyMs =
+      latencies.length > 0 ? (latencies[Math.floor(latencies.length * 0.5)] ?? 0) : 0
+    const p90LatencyMs =
+      latencies.length > 0 ? (latencies[Math.floor(latencies.length * 0.9)] ?? 0) : 0
+    const avgLatencyMs = totalRequests > 0 ? Math.round(totalLatencyMs / totalRequests) : 0
+    const avgTtftMs = ttftCount > 0 ? Math.round(totalTtftMs / ttftCount) : 0
+    const cacheHitRate =
+      totalPromptTokens > 0 ? Number((totalCachedTokens / totalPromptTokens).toFixed(4)) : 0
+
+    const accounts: StatsOverviewAccount[] = Array.from(accountMap.values()).map((acc) => ({
+      accountId: acc.accountId,
+      totalRequests: acc.totalRequests,
+      successRequests: acc.successRequests,
+      failedRequests: acc.failedRequests,
+      promptTokens: acc.promptTokens,
+      cachedTokens: acc.cachedTokens,
+      outputTokens: acc.outputTokens,
+      cacheHitRate:
+        acc.promptTokens > 0 ? Number((acc.cachedTokens / acc.promptTokens).toFixed(4)) : 0,
+      avgLatencyMs: acc.totalRequests > 0 ? Math.round(acc.totalLatencyMs / acc.totalRequests) : 0,
+    }))
+
+    return {
+      overview: {
+        totalRequests,
+        totalSuccess,
+        totalFailed,
+        totalAbort,
+        totalTokens: totalPromptTokens + totalOutputTokens,
+        totalPromptTokens,
+        totalCachedTokens,
+        totalOutputTokens,
+        cacheHitRate,
+        avgLatencyMs,
+        avgTtftMs,
+        p50LatencyMs,
+        p90LatencyMs,
+      },
+      accounts,
+    }
+  }
+
+  async getAccountUsage(): Promise<AccountUsageMetric[]> {
+    this.assertNotClosed()
+    const map = new Map<string, AccountUsageMetric>()
+    for (const r of this.requests) {
+      let u = map.get(r.accountId)
+      if (!u) {
+        u = {
+          accountId: r.accountId,
+          totalRequests: 0,
+          successRequests: 0,
+          failedRequests: 0,
+          promptTokens: 0,
+          cachedTokens: 0,
+          outputTokens: 0,
+          totalLatencyMs: 0,
+          lastUsed: null,
+        }
+        map.set(r.accountId, u)
+      }
+      u.totalRequests++
+      if (r.status === 'success') u.successRequests++
+      else u.failedRequests++
+      u.promptTokens += r.promptTokens
+      u.cachedTokens += r.cachedTokens
+      u.outputTokens += r.outputTokens
+      u.totalLatencyMs += r.latencyMs
+      if (u.lastUsed === null || r.timestamp > u.lastUsed) {
+        u.lastUsed = r.timestamp
+      }
+    }
+    return Array.from(map.values())
+  }
+
+  async getAggregatedMetrics(
+    intervalMs: number,
+    since?: number,
+    until?: number,
+    limit = 1000,
+  ): Promise<AggregatedBucketMetric[]> {
+    this.assertNotClosed()
+    const safeInterval = Math.max(1000, intervalMs)
+    const bucketMap = new Map<number, AggregatedBucketMetric>()
+
+    for (const r of this.requests) {
+      if (since !== undefined && r.timestamp < since) continue
+      if (until !== undefined && r.timestamp > until) continue
+
+      const bKey = Math.floor(r.timestamp / safeInterval) * safeInterval
+      let b = bucketMap.get(bKey)
+      if (!b) {
+        b = {
+          bucket: bKey,
+          requests: 0,
+          successCount: 0,
+          failedCount: 0,
+          promptTokens: 0,
+          cachedTokens: 0,
+          outputTokens: 0,
+          totalLatencyMs: 0,
+          totalTtftMs: 0,
+          ttftCount: 0,
+        }
+        bucketMap.set(bKey, b)
+      }
+      b.requests++
+      if (r.status === 'success') b.successCount++
+      else b.failedCount++
+      b.promptTokens += r.promptTokens
+      b.cachedTokens += r.cachedTokens
+      b.outputTokens += r.outputTokens
+      b.totalLatencyMs += r.latencyMs
+      if (typeof r.ttftMs === 'number') {
+        b.totalTtftMs += r.ttftMs
+        b.ttftCount++
+      }
+    }
+
+    const sorted = Array.from(bucketMap.values())
+      .sort((a, b) => a.bucket - b.bucket)
+      .slice(0, Math.max(1, limit))
+
+    return sorted
   }
 
   private assertNotClosed(): void {
@@ -180,7 +434,15 @@ export function createStatsStorage(config: StatsConfig): IStatsStorage {
 
   // If node:sqlite is available, use SqliteStatsStorage for local/sqlite files
   if (isSqliteAvailable()) {
-    return new SqliteStatsStorage(dbPath)
+    try {
+      return new SqliteStatsStorage(dbPath)
+    } catch (err) {
+      console.warn(
+        `[cloudcode-link-core] Failed to initialize SqliteStatsStorage for "${dbPath}". Falling back to MemoryStatsStorage.`,
+        err,
+      )
+      return new MemoryStatsStorage()
+    }
   }
 
   console.warn(

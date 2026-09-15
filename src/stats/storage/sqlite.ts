@@ -3,12 +3,16 @@ import { chmodSync, mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import type { DatabaseSync, StatementSync } from 'node:sqlite'
 import type {
+  AccountUsageMetric,
+  AggregatedBucketMetric,
   IStatsStorage,
+  OverviewMetricsResult,
   RequestMetric,
   RequestMetricFilter,
   SessionMetric,
   SessionMetricDelta,
   SessionMetricFilter,
+  StatsOverviewAccount,
 } from '../types.ts'
 
 const require = createRequire(import.meta.url)
@@ -93,6 +97,7 @@ export class SqliteStatsStorage implements IStatsStorage {
         timestamp INTEGER NOT NULL,
         status TEXT NOT NULL,
         latencyMs INTEGER NOT NULL,
+        ttftMs INTEGER,
         cacheHit INTEGER NOT NULL,
         promptTokens INTEGER NOT NULL,
         cachedTokens INTEGER NOT NULL,
@@ -101,6 +106,7 @@ export class SqliteStatsStorage implements IStatsStorage {
       CREATE INDEX IF NOT EXISTS idx_requests_timestamp ON request_metrics(timestamp DESC);
       CREATE INDEX IF NOT EXISTS idx_requests_session ON request_metrics(sessionId);
       CREATE INDEX IF NOT EXISTS idx_requests_account ON request_metrics(accountId);
+      CREATE INDEX IF NOT EXISTS idx_requests_latency ON request_metrics(latencyMs ASC);
 
       CREATE TABLE IF NOT EXISTS session_metrics (
         sessionId TEXT PRIMARY KEY,
@@ -118,11 +124,17 @@ export class SqliteStatsStorage implements IStatsStorage {
       CREATE INDEX IF NOT EXISTS idx_sessions_account ON session_metrics(accountId);
     `)
 
+    try {
+      this.db.exec('ALTER TABLE request_metrics ADD COLUMN ttftMs INTEGER;')
+    } catch {
+      // Column may already exist
+    }
+
     this.insertRequestStmt = this.db.prepare(`
       INSERT OR REPLACE INTO request_metrics (
         requestId, sessionId, accountId, model, timestamp, status,
-        latencyMs, cacheHit, promptTokens, cachedTokens, outputTokens
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        latencyMs, ttftMs, cacheHit, promptTokens, cachedTokens, outputTokens
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `)
 
     this.upsertSessionStmt = this.db.prepare(`
@@ -210,6 +222,7 @@ export class SqliteStatsStorage implements IStatsStorage {
           m.timestamp,
           m.status,
           m.latencyMs,
+          m.ttftMs ?? null,
           m.cacheHit ? 1 : 0,
           m.promptTokens,
           m.cachedTokens,
@@ -337,10 +350,26 @@ export class SqliteStatsStorage implements IStatsStorage {
       query += ' AND accountId = ?'
       params.push(filter.accountId)
     }
+    if (filter?.status) {
+      query += ' AND status = ?'
+      params.push(filter.status)
+    }
+    if (filter?.since !== undefined) {
+      query += ' AND timestamp >= ?'
+      params.push(filter.since)
+    }
+    if (filter?.until !== undefined) {
+      query += ' AND timestamp <= ?'
+      params.push(filter.until)
+    }
     query += ' ORDER BY timestamp DESC'
     if (filter?.limit !== undefined && filter.limit >= 0) {
       query += ' LIMIT ?'
       params.push(filter.limit)
+      if (filter?.offset !== undefined && filter.offset >= 0) {
+        query += ' OFFSET ?'
+        params.push(filter.offset)
+      }
     }
 
     const stmt = this.db.prepare(query)
@@ -353,11 +382,45 @@ export class SqliteStatsStorage implements IStatsStorage {
       timestamp: Number(r.timestamp),
       status: r.status as RequestMetric['status'],
       latencyMs: Number(r.latencyMs),
+      ttftMs: r.ttftMs != null ? Number(r.ttftMs) : undefined,
       cacheHit: Boolean(r.cacheHit),
       promptTokens: Number(r.promptTokens),
       cachedTokens: Number(r.cachedTokens),
       outputTokens: Number(r.outputTokens),
     }))
+  }
+
+  async countRequests(filter?: RequestMetricFilter): Promise<number> {
+    this.assertNotClosed()
+    if (!this.db) return 0
+
+    let query = 'SELECT COUNT(*) as count FROM request_metrics WHERE 1=1'
+    const params: any[] = []
+
+    if (filter?.sessionId) {
+      query += ' AND sessionId = ?'
+      params.push(filter.sessionId)
+    }
+    if (filter?.accountId) {
+      query += ' AND accountId = ?'
+      params.push(filter.accountId)
+    }
+    if (filter?.status) {
+      query += ' AND status = ?'
+      params.push(filter.status)
+    }
+    if (filter?.since !== undefined) {
+      query += ' AND timestamp >= ?'
+      params.push(filter.since)
+    }
+    if (filter?.until !== undefined) {
+      query += ' AND timestamp <= ?'
+      params.push(filter.until)
+    }
+
+    const stmt = this.db.prepare(query)
+    const row = stmt.get(...params) as any
+    return Number(row?.count ?? 0)
   }
 
   async querySessions(filter?: SessionMetricFilter): Promise<SessionMetric[]> {
@@ -390,6 +453,212 @@ export class SqliteStatsStorage implements IStatsStorage {
       totalPromptTokens: Number(r.totalPromptTokens),
       totalCachedTokens: Number(r.totalCachedTokens),
       cacheHitRate: Number(r.cacheHitRate),
+    }))
+  }
+
+  async getOverviewMetrics(): Promise<OverviewMetricsResult> {
+    this.assertNotClosed()
+    const emptyResult: OverviewMetricsResult = {
+      overview: {
+        totalRequests: 0,
+        totalSuccess: 0,
+        totalFailed: 0,
+        totalAbort: 0,
+        totalTokens: 0,
+        totalPromptTokens: 0,
+        totalCachedTokens: 0,
+        totalOutputTokens: 0,
+        cacheHitRate: 0,
+        avgLatencyMs: 0,
+        avgTtftMs: 0,
+        p50LatencyMs: 0,
+        p90LatencyMs: 0,
+      },
+      accounts: [],
+    }
+    if (!this.db) return emptyResult
+
+    const row = this.db
+      .prepare(
+        `SELECT
+          COUNT(*) as totalRequests,
+          SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as totalSuccess,
+          SUM(CASE WHEN status = 'abort' THEN 1 ELSE 0 END) as totalAbort,
+          SUM(CASE WHEN status != 'success' AND status != 'abort' THEN 1 ELSE 0 END) as totalFailed,
+          SUM(promptTokens) as totalPromptTokens,
+          SUM(cachedTokens) as totalCachedTokens,
+          SUM(outputTokens) as totalOutputTokens,
+          AVG(latencyMs) as avgLatencyMs,
+          AVG(CASE WHEN ttftMs IS NOT NULL THEN ttftMs ELSE NULL END) as avgTtftMs
+        FROM request_metrics`,
+      )
+      .get() as any
+
+    const totalRequests = Number(row?.totalRequests ?? 0)
+    if (totalRequests === 0) {
+      return emptyResult
+    }
+
+    const totalSuccess = Number(row?.totalSuccess ?? 0)
+    const totalAbort = Number(row?.totalAbort ?? 0)
+    const totalFailed = Number(row?.totalFailed ?? 0)
+    const totalPromptTokens = Number(row?.totalPromptTokens ?? 0)
+    const totalCachedTokens = Number(row?.totalCachedTokens ?? 0)
+    const totalOutputTokens = Number(row?.totalOutputTokens ?? 0)
+    const avgLatencyMs = Math.round(Number(row?.avgLatencyMs ?? 0))
+    const avgTtftMs = Math.round(Number(row?.avgTtftMs ?? 0))
+    const cacheHitRate =
+      totalPromptTokens > 0 ? Number((totalCachedTokens / totalPromptTokens).toFixed(4)) : 0
+
+    let p50LatencyMs = 0
+    let p90LatencyMs = 0
+    const off50 = Math.floor(totalRequests * 0.5)
+    const off90 = Math.floor(totalRequests * 0.9)
+    const p50Row = this.db
+      .prepare('SELECT latencyMs FROM request_metrics ORDER BY latencyMs ASC LIMIT 1 OFFSET ?')
+      .get(off50) as any
+    if (p50Row) p50LatencyMs = Number(p50Row.latencyMs ?? 0)
+
+    const p90Row = this.db
+      .prepare('SELECT latencyMs FROM request_metrics ORDER BY latencyMs ASC LIMIT 1 OFFSET ?')
+      .get(off90) as any
+    if (p90Row) p90LatencyMs = Number(p90Row.latencyMs ?? 0)
+
+    const accountRows = this.db
+      .prepare(
+        `SELECT
+          accountId,
+          COUNT(*) as totalRequests,
+          SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as successRequests,
+          SUM(CASE WHEN status != 'success' AND status != 'abort' THEN 1 ELSE 0 END) as failedRequests,
+          SUM(promptTokens) as promptTokens,
+          SUM(cachedTokens) as cachedTokens,
+          SUM(outputTokens) as outputTokens,
+          AVG(latencyMs) as avgLatencyMs
+        FROM request_metrics
+        GROUP BY accountId`,
+      )
+      .all() as any[]
+
+    const accounts: StatsOverviewAccount[] = accountRows.map((r) => {
+      const pTok = Number(r.promptTokens ?? 0)
+      const cTok = Number(r.cachedTokens ?? 0)
+      return {
+        accountId: String(r.accountId),
+        totalRequests: Number(r.totalRequests ?? 0),
+        successRequests: Number(r.successRequests ?? 0),
+        failedRequests: Number(r.failedRequests ?? 0),
+        promptTokens: pTok,
+        cachedTokens: cTok,
+        outputTokens: Number(r.outputTokens ?? 0),
+        cacheHitRate: pTok > 0 ? Number((cTok / pTok).toFixed(4)) : 0,
+        avgLatencyMs: Math.round(Number(r.avgLatencyMs ?? 0)),
+      }
+    })
+
+    return {
+      overview: {
+        totalRequests,
+        totalSuccess,
+        totalFailed,
+        totalAbort,
+        totalTokens: totalPromptTokens + totalOutputTokens,
+        totalPromptTokens,
+        totalCachedTokens,
+        totalOutputTokens,
+        cacheHitRate,
+        avgLatencyMs,
+        avgTtftMs,
+        p50LatencyMs,
+        p90LatencyMs,
+      },
+      accounts,
+    }
+  }
+
+  async getAccountUsage(): Promise<AccountUsageMetric[]> {
+    this.assertNotClosed()
+    if (!this.db) return []
+
+    const rows = this.db
+      .prepare(
+        `SELECT
+          accountId,
+          COUNT(*) as totalRequests,
+          SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as successRequests,
+          SUM(CASE WHEN status != 'success' AND status != 'abort' THEN 1 ELSE 0 END) as failedRequests,
+          SUM(promptTokens) as promptTokens,
+          SUM(cachedTokens) as cachedTokens,
+          SUM(outputTokens) as outputTokens,
+          SUM(latencyMs) as totalLatencyMs,
+          MAX(timestamp) as lastUsed
+        FROM request_metrics
+        GROUP BY accountId`,
+      )
+      .all() as any[]
+
+    return rows.map((r) => ({
+      accountId: String(r.accountId),
+      totalRequests: Number(r.totalRequests ?? 0),
+      successRequests: Number(r.successRequests ?? 0),
+      failedRequests: Number(r.failedRequests ?? 0),
+      promptTokens: Number(r.promptTokens ?? 0),
+      cachedTokens: Number(r.cachedTokens ?? 0),
+      outputTokens: Number(r.outputTokens ?? 0),
+      totalLatencyMs: Number(r.totalLatencyMs ?? 0),
+      lastUsed: r.lastUsed != null ? Number(r.lastUsed) : null,
+    }))
+  }
+
+  async getAggregatedMetrics(
+    intervalMs: number,
+    since?: number,
+    until?: number,
+    limit = 1000,
+  ): Promise<AggregatedBucketMetric[]> {
+    this.assertNotClosed()
+    if (!this.db) return []
+
+    const safeInterval = Math.max(1000, intervalMs)
+    let query = `SELECT
+      CAST(timestamp / ? AS INTEGER) * ? as bucket,
+      COUNT(*) as requests,
+      SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as successCount,
+      SUM(CASE WHEN status != 'success' AND status != 'abort' THEN 1 ELSE 0 END) as failedCount,
+      SUM(promptTokens) as promptTokens,
+      SUM(cachedTokens) as cachedTokens,
+      SUM(outputTokens) as outputTokens,
+      SUM(latencyMs) as totalLatencyMs,
+      SUM(CASE WHEN ttftMs IS NOT NULL THEN ttftMs ELSE 0 END) as totalTtftMs,
+      COUNT(ttftMs) as ttftCount
+    FROM request_metrics
+    WHERE 1=1`
+
+    const params: any[] = [safeInterval, safeInterval]
+    if (since !== undefined) {
+      query += ' AND timestamp >= ?'
+      params.push(since)
+    }
+    if (until !== undefined) {
+      query += ' AND timestamp <= ?'
+      params.push(until)
+    }
+
+    query += ' GROUP BY bucket ORDER BY bucket ASC LIMIT ?'
+    params.push(Math.max(1, limit))
+
+    const rows = this.db.prepare(query).all(...params) as any[]
+    return rows.map((r) => ({
+      bucket: Number(r.bucket),
+      requests: Number(r.requests ?? 0),
+      successCount: Number(r.successCount ?? 0),
+      failedCount: Number(r.failedCount ?? 0),
+      promptTokens: Number(r.promptTokens ?? 0),
+      cachedTokens: Number(r.cachedTokens ?? 0),
+      outputTokens: Number(r.outputTokens ?? 0),
+      totalLatencyMs: Number(r.totalLatencyMs ?? 0),
+      totalTtftMs: Number(r.totalTtftMs ?? 0),
+      ttftCount: Number(r.ttftCount ?? 0),
     }))
   }
 

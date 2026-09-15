@@ -71,6 +71,9 @@ export class StatsCollector {
       const cachedTokens = Math.max(0, Math.floor(input.cachedTokens))
       const outputTokens = Math.max(0, Math.floor(input.outputTokens))
       const latencyMs = Math.max(0, Math.floor(input.latencyMs))
+      const ttftMs = typeof input.ttftMs === 'number' && Number.isFinite(input.ttftMs)
+        ? Math.max(0, Math.floor(input.ttftMs))
+        : undefined
 
       const cacheHit = cachedTokens > 0
 
@@ -82,6 +85,7 @@ export class StatsCollector {
         timestamp,
         status: input.status,
         latencyMs,
+        ttftMs,
         cacheHit,
         promptTokens,
         cachedTokens,
@@ -232,6 +236,11 @@ export class StatsCollector {
     }
     if (typeof input.latencyMs !== 'number' || !Number.isFinite(input.latencyMs) || input.latencyMs < 0) {
       throw new Error(`Invalid latencyMs: ${input.latencyMs}. Must be a non-negative finite number.`)
+    }
+    if (input.ttftMs !== undefined) {
+      if (typeof input.ttftMs !== 'number' || !Number.isFinite(input.ttftMs) || input.ttftMs < 0) {
+        throw new Error(`Invalid ttftMs: ${input.ttftMs}. Must be a non-negative finite number.`)
+      }
     }
     if (typeof input.promptTokens !== 'number' || !Number.isFinite(input.promptTokens) || input.promptTokens < 0) {
       throw new Error(`Invalid promptTokens: ${input.promptTokens}. Must be a non-negative finite number.`)
