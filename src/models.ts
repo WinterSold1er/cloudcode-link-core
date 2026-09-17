@@ -4,7 +4,7 @@
 // stay verbatim with no effort toggle, matching observed agy behavior
 // (agy rejects --effort for Claude/GPT-OSS). Discovery failure falls back to
 // a bundled catalog so the /model picker is never empty.
-import { DEFAULT_FALLBACK_MODELS, type FallbackModelDef, type PluginConfig } from './types/config-types.ts'
+import { DEFAULT_FALLBACK_MODELS, type FallbackModelDef, type ModelModality, type PluginConfig } from './types/config-types.ts'
 
 export interface RawModel { slug: string; label: string }
 
@@ -26,6 +26,8 @@ export interface CatalogEntry {
   name: string
   /** null = fixed-thinking model (no effort flag). */
   efforts: readonly string[] | null
+  /** Accepted input modalities (e.g. ['text', 'image']). */
+  inputModalities?: readonly ModelModality[]
 }
 
 export interface Catalog {
@@ -121,6 +123,14 @@ function extractModelList(parsed: unknown): RawModel[] | null {
 
 const EFFORT_SUFFIXES = ['low', 'medium', 'high']
 
+export function getInputModalitiesForModel(modelId: string): readonly ModelModality[] {
+  const wire = resolveModelSlug(modelId).toLowerCase()
+  if (wire.startsWith('gpt-oss-')) {
+    return ['text']
+  }
+  return ['text', 'image']
+}
+
 export function deriveEffortsForModel(modelId: string): string[] | null {
   const id = modelId.toLowerCase()
   if (id === 'gemini-3.1-pro' || id.startsWith('gemini-3.1-pro')) {
@@ -143,7 +153,7 @@ export function foldEfforts(raw: readonly RawModel[]): CatalogEntry[] {
   const slugSet = new Set(raw.map((r) => r.slug))
   for (const r of raw) {
     if (!r.slug.startsWith('gemini')) {
-      verbatim.push({ id: r.slug, name: r.label, efforts: null });
+      verbatim.push({ id: r.slug, name: r.label, efforts: null, inputModalities: getInputModalitiesForModel(r.slug) });
       continue;
     }
 
@@ -184,12 +194,17 @@ export function foldEfforts(raw: readonly RawModel[]): CatalogEntry[] {
         }
       }
     }
-    if (!folded) verbatim.push({ id: r.slug, name: r.label, efforts: null });
+    if (!folded) verbatim.push({ id: r.slug, name: r.label, efforts: null, inputModalities: getInputModalitiesForModel(r.slug) });
   }
   const folded: CatalogEntry[] = []
   for (const [id, v] of bases) {
     const efforts = EFFORT_SUFFIXES.filter((e) => v.efforts.has(e));
-    folded.push({ id, name: v.label !== '' ? v.label : id, efforts: efforts.length > 0 ? efforts : null });
+    folded.push({
+      id,
+      name: v.label !== '' ? v.label : id,
+      efforts: efforts.length > 0 ? efforts : null,
+      inputModalities: getInputModalitiesForModel(id),
+    });
   }
   // Folded bases first, then verbatim, both stable by original order.
   const rawOrder = new Map(raw.map((r, i) => [r.slug, i] as const))
@@ -219,6 +234,7 @@ export function buildFallbackCatalog(defs: readonly FallbackModelDef[]): Catalog
       id: d.id.trim(),
       name: (typeof d.name === 'string' && d.name.trim() !== '') ? d.name.trim() : d.id.trim(),
       efforts: Array.isArray(d.efforts) && d.efforts.length > 0 ? d.efforts.filter((e) => typeof e === 'string' && e.trim() !== '') : null,
+      inputModalities: d.inputModalities ?? getInputModalitiesForModel(d.id),
     }));
 }
 

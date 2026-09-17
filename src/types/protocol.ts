@@ -98,16 +98,20 @@ export interface GenerateOptions {
   [key: string]: unknown
 }
 
+export type ModelModality = 'text' | 'image'
+
 export interface LlmModelInfo {
   provider: string
   id: string
   name: string
+  inputModalities?: readonly ModelModality[]
 }
 
 export interface LlmResolvedModelInfo {
   provider: string
   id: string
   name: string
+  inputModalities?: readonly ModelModality[]
   context: { contextWindow: number }
   defaultMaxTokens: number
   reasoning?: {

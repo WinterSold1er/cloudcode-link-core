@@ -4,11 +4,15 @@ export const PROVIDER_ID = 'antigravity'
 export const PLUGIN_ID = 'cloudcode-link'
 export const PKG_NAME = 'cloudcode-link-core'
 
+export type ModelModality = 'text' | 'image'
+
 export interface FallbackModelDef {
   id: string
   name: string
   /** Selectable reasoning efforts; omit for fixed-thinking models. */
   efforts?: readonly string[]
+  /** Accepted input modalities (e.g. ['text', 'image']). */
+  inputModalities?: readonly ModelModality[]
 }
 
 export interface CoreConfig {
@@ -118,14 +122,14 @@ export const DEFAULT_ENDPOINT_CANDIDATES: readonly string[] = [
 
 // Full fallback line-up
 export const DEFAULT_FALLBACK_MODELS: readonly FallbackModelDef[] = [
-  { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', efforts: ['low', 'medium', 'high'] },
-  { id: 'gemini-3.7-flash', name: 'Gemini 3.7 Flash', efforts: ['low', 'medium', 'high'] },
-  { id: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash', efforts: ['low', 'medium', 'high'] },
-  { id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash', efforts: ['low', 'medium', 'high'] },
-  { id: 'gemini-3.1-pro', name: 'Gemini 3.1 Pro', efforts: ['low', 'high'] },
-  { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6 (Thinking)' },
-  { id: 'claude-opus-4-6-thinking', name: 'Claude Opus 4.6 (Thinking)' },
-  { id: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)' },
+  { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', efforts: ['low', 'medium', 'high'], inputModalities: ['text', 'image'] },
+  { id: 'gemini-3.7-flash', name: 'Gemini 3.7 Flash', efforts: ['low', 'medium', 'high'], inputModalities: ['text', 'image'] },
+  { id: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash', efforts: ['low', 'medium', 'high'], inputModalities: ['text', 'image'] },
+  { id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash', efforts: ['low', 'medium', 'high'], inputModalities: ['text', 'image'] },
+  { id: 'gemini-3.1-pro', name: 'Gemini 3.1 Pro', efforts: ['low', 'high'], inputModalities: ['text', 'image'] },
+  { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6 (Thinking)', inputModalities: ['text', 'image'] },
+  { id: 'claude-opus-4-6-thinking', name: 'Claude Opus 4.6 (Thinking)', inputModalities: ['text', 'image'] },
+  { id: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)', inputModalities: ['text'] },
 ]
 
 export const Err = {
