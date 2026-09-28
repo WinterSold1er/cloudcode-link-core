@@ -361,5 +361,26 @@ export function sanitizeTopology(contents: GeminiContent[]): GeminiContent[] {
     })
   }
 
+  // Ensure conversation ends with 'user' (CloudCode rejects trailing model turns)
+  const lastTurn = result[result.length - 1]
+  if (lastTurn?.role === 'model') {
+    const responses: GeminiPart[] = []
+    for (const part of lastTurn.parts) {
+      if ('functionCall' in part && part.functionCall) {
+        responses.push({
+          functionResponse: {
+            name: part.functionCall.name,
+            ...(part.functionCall.id ? { id: part.functionCall.id } : {}),
+            response: { output: 'Tool was not executed in this request; no result available.' },
+          },
+        })
+      }
+    }
+    result.push({
+      role: 'user',
+      parts: responses.length > 0 ? responses : [{ text: 'Continue.' }],
+    })
+  }
+
   return result
 }
