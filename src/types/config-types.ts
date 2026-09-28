@@ -1,10 +1,13 @@
 // Configuration and error classifications for cloudcode-link-core
 
+import type { ModelModality } from './protocol.ts'
+
 export const PROVIDER_ID = 'antigravity'
 export const PLUGIN_ID = 'cloudcode-link'
 export const PKG_NAME = 'cloudcode-link-core'
 
-export type ModelModality = 'text' | 'image'
+/** Re-exported from the protocol contract so one modality list exists, not two. */
+export type { ModelModality }
 
 export interface FallbackModelDef {
   id: string

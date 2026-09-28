@@ -26,7 +26,7 @@ import {
 } from './client.ts'
 import type { SessionStore } from './sessions.ts'
 import { convertTools } from './schema-converter.ts'
-import { convertMessages, type ImageReader } from './message-converter.ts'
+import { convertRequest, type ImageReader } from './message-converter.ts'
 import { mapSseStreamToChunks } from './sse-mapper.ts'
 
 export interface AgyAdapterDeps {
@@ -152,7 +152,17 @@ export class AgyAdapter {
       const thinkingConfig = getThinkingConfig(options.model, options.reasoningEffort)
 
       const convertedTools = convertTools(options.tools, isClaude || isGptOss)
-      const contents = await convertMessages(options.messages, this.deps.readImage, wireModel)
+      // One projection per request: it carries the system instruction (DSH v4
+      // delivers the loop's prompt as a system message) and every mapping loss.
+      const projection = await convertRequest(options.messages, {
+        readImage: this.deps.readImage,
+        runtimeModel: wireModel,
+        system: options.system,
+      })
+      const contents = projection.contents
+      for (const warning of projection.warnings) {
+        this.deps.log?.(`cloudcode message mapping: ${warning}`)
+      }
 
       // Session management & session affinity (FR-01, FR-02)
       const rawSessionId = options.sessionId ? String(options.sessionId) : undefined
@@ -303,12 +313,8 @@ export class AgyAdapter {
             model: wireModel,
             request: {
               contents,
-              ...(options.system
-                ? {
-                    systemInstruction: {
-                      parts: [{ text: options.system }],
-                    },
-                  }
+              ...(projection.systemInstruction
+                ? { systemInstruction: projection.systemInstruction }
                 : {}),
               generationConfig: {
                 ...(typeof options.temperature === 'number' ? { temperature: options.temperature } : {}),

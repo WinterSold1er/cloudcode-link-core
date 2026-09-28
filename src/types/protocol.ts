@@ -1,6 +1,20 @@
-// Headless protocol types compatible with modern LLM harnesses
+/**
+ * Model-facing message contract as DSH (dsh-llm >= 0.1.7, session format v4)
+ * hands it to a provider adapter, kept permissive enough to also accept the
+ * legacy Anthropic-style shapes this plugin supported before v4.
+ *
+ * Roles: `system`, `developer`, `user`, `assistant`, `tool`. Tool results are
+ * their OWN `role: 'tool'` message carrying `toolCallId` / `isError` / content;
+ * the legacy `{type:'tool_result'}` block inside a user message is still read.
+ *
+ * Content blocks are merge-extensible in DSH, so an adapter must handle
+ * unknown `type`s explicitly instead of ignoring them.
+ */
 
 export type CallId = string
+
+/** Message roles DSH can deliver, plus unknown/legacy strings an adapter must survive. */
+export type MessageRole = 'system' | 'developer' | 'user' | 'assistant' | 'tool'
 
 export interface TextBlock {
   type: 'text'
@@ -10,33 +24,71 @@ export interface TextBlock {
 export interface ReasoningBlock {
   type: 'reasoning'
   text: string
+  /**
+   * Provider-issued Gemini thinking signature. Declared here (and read
+   * tolerantly from the wire) because Gemini 3 rejects history whose
+   * functionCall parts lost the signature they were produced with.
+   */
   thoughtSignature?: string
 }
 
 export interface ToolCallBlock {
-  type: 'tool_call'
-  id: CallId
+  /** DSH spells it `tool-call`; the legacy alias is still accepted. */
+  type: 'tool-call' | 'tool_call'
+  /** Provider-issued call id; correlates with the matching tool result. */
+  id?: CallId
   name: string
-  arguments: Record<string, unknown>
+  /** Raw JSON string as produced by DSH v4; legacy callers pass an object. */
+  arguments: string | Record<string, unknown>
   thoughtSignature?: string
 }
 
+/**
+ * Legacy Anthropic-style tool result carried inside a user message.
+ * DSH v4 no longer emits this; it stays supported for older hosts.
+ */
 export interface ToolResultBlock {
-  type: 'tool_result'
-  id: CallId
-  result: unknown
+  type: 'tool_result' | 'tool-result'
+  id?: CallId
+  toolCallId?: CallId
+  toolName?: string
+  result?: unknown
+  content?: unknown
+  isError?: boolean
 }
 
 export interface ImageAttachment {
-  id: string
+  id?: string
+  /** DSH `ImageAttachmentRef` fields an adapter may read. */
+  attachmentId?: string
+  mimeType?: string
   [key: string]: unknown
 }
 
 export interface ImageBlock {
   type: 'image'
-  mimeType: string
+  mimeType?: string
   data?: Uint8Array | Buffer | string
   attachment?: ImageAttachment
+  /** DSH already replaced the bytes with placeholder text; send no inline data. */
+  offloaded?: true
+}
+
+export interface FileBlock {
+  type: 'file'
+  attachment?: ImageAttachment
+}
+
+/** Developer-message block activating a deferred tool declaration. */
+export interface ToolAdditionBlock {
+  type: 'tool-addition'
+  toolName: string
+}
+
+/** Developer-message block deactivating a tool declaration. */
+export interface ToolRemovalBlock {
+  type: 'tool-removal'
+  toolName: string
 }
 
 export type ContentBlock =
@@ -45,13 +97,25 @@ export type ContentBlock =
   | ToolCallBlock
   | ToolResultBlock
   | ImageBlock
+  | FileBlock
+  | ToolAdditionBlock
+  | ToolRemovalBlock
   | { type: string; [key: string]: unknown }
 
+/** A conversation message whose content the model reads. */
 export interface Message {
   id?: string
-  role: 'system' | 'user' | 'assistant' | string
+  role: MessageRole | (string & {})
   content: string | ContentBlock[]
+  source?: unknown
   [key: string]: unknown
+}
+
+/** A DSH v4 tool result: its own message role, correlated by `toolCallId`. */
+export interface ToolResultMessage extends Message {
+  role: 'tool'
+  toolCallId: CallId
+  isError?: boolean
 }
 
 export interface ToolSchema {
