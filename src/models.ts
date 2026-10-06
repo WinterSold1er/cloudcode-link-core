@@ -38,6 +38,26 @@ export interface Catalog {
   lastError?: string
 }
 
+export function prettifyModelSlug(slug: string): string {
+  if (!slug) return ''
+  const normalized = slug.trim().replace(/(\d+)-(\d+)/g, '$1.$2')
+  const tokens = normalized.split(/[-_]+/)
+  const formatted = tokens.map((token) => {
+    const lower = token.toLowerCase()
+    if (lower === 'gpt') return 'GPT'
+    if (lower === 'oss') return 'OSS'
+    if (/^\d+b$/i.test(lower)) return lower.toUpperCase()
+    if (/^\d+(?:\.\d+)?$/.test(token)) return token
+    return token.charAt(0).toUpperCase() + token.slice(1).toLowerCase()
+  })
+  return formatted.join(' ')
+}
+
+export function isInternalModel(slug: string): boolean {
+  const s = slug.trim().toLowerCase()
+  return /^chat_\d+$/i.test(s) || /^tab[_-]/i.test(s) || /_preview$/i.test(s) || /-preview$/i.test(s)
+}
+
 /** Parse `agy models` stdout: JSON shapes first, then two-column text. */
 export function parseModelsOutput(stdout: string): RawModel[] {
   const text = stdout.trim()
@@ -56,8 +76,11 @@ export function parseModelsOutput(stdout: string): RawModel[] {
     // agy 1.1.15 prints a TAB-separated two-column table; older builds and
     // some locales use two-or-more spaces.
     const m = t.match(/^(\S+)(?:\t+|\s{2,})(.+)$/)
-    if (m && m[1] !== undefined && m[2] !== undefined) out.push({ slug: m[1], label: m[2].trim() });
-    else if (/^\S+$/.test(t)) out.push({ slug: t, label: t });
+    if (m && m[1] !== undefined && m[2] !== undefined) {
+      if (!isInternalModel(m[1])) out.push({ slug: m[1], label: m[2].trim() });
+    } else if (/^\S+$/.test(t)) {
+      if (!isInternalModel(t)) out.push({ slug: t, label: prettifyModelSlug(t) });
+    }
   }
   return dedupeBySlug(out);
 }
@@ -71,7 +94,10 @@ function dedupeBySlug(raw: readonly RawModel[]): RawModel[] {
     const slug = r.slug.trim()
     if (slug === '' || seen.has(slug)) continue
     seen.add(slug)
-    out.push({ slug, label: (typeof r.label === 'string' && r.label.trim() !== '') ? r.label.trim() : slug })
+    const label = (typeof r.label === 'string' && r.label.trim() !== '' && r.label.trim() !== slug)
+      ? r.label.trim()
+      : prettifyModelSlug(slug)
+    out.push({ slug, label })
   }
   return out
 }
@@ -85,14 +111,17 @@ function extractModelList(parsed: unknown): RawModel[] | null {
       const out: RawModel[] = []
       for (const [key, val] of Object.entries(o.models as Record<string, unknown>)) {
         if (!key || typeof key !== 'string') continue
+        const trimmedKey = key.trim()
+        if (isInternalModel(trimmedKey)) continue
         const v = (val && typeof val === 'object' ? val : {}) as Record<string, unknown>
-        const label =
+        const rawLabel =
           (typeof v.displayName === 'string' && v.displayName.trim() !== '') ? v.displayName.trim()
           : (typeof v.display_name === 'string' && v.display_name.trim() !== '') ? v.display_name.trim()
           : (typeof v.modelName === 'string' && v.modelName.trim() !== '') ? v.modelName.trim()
           : (typeof v.name === 'string' && v.name.trim() !== '') ? v.name.trim()
-          : key
-        out.push({ slug: key.trim(), label })
+          : ''
+        const label = rawLabel !== '' && rawLabel !== trimmedKey ? rawLabel : prettifyModelSlug(trimmedKey)
+        out.push({ slug: trimmedKey, label })
       }
       return out
     }
@@ -107,16 +136,22 @@ function extractModelList(parsed: unknown): RawModel[] | null {
   const out: RawModel[] = []
   for (const item of arr) {
     if (typeof item === 'string') {
-      out.push({ slug: item, label: item });
+      const trimmed = item.trim()
+      if (isInternalModel(trimmed)) continue
+      out.push({ slug: trimmed, label: prettifyModelSlug(trimmed) });
       continue;
     }
     if (!item || typeof item !== 'object') continue
     const o = item as Record<string, unknown>
     const slugV = o.slug ?? o.id ?? o.name ?? o.model;
-    const labelV = o.label ?? o.display_name ?? o.displayName ?? o.title ?? slugV;
-    if (typeof slugV === 'string' && slugV !== '') {
-      out.push({ slug: slugV, label: typeof labelV === 'string' ? labelV : slugV });
-    }
+    if (typeof slugV !== 'string' || slugV.trim() === '') continue
+    const trimmedSlug = slugV.trim()
+    if (isInternalModel(trimmedSlug)) continue
+    const rawLabel = o.label ?? o.display_name ?? o.displayName ?? o.title;
+    const labelStr = (typeof rawLabel === 'string' && rawLabel.trim() !== '' && rawLabel.trim() !== trimmedSlug)
+      ? rawLabel.trim()
+      : prettifyModelSlug(trimmedSlug)
+    out.push({ slug: trimmedSlug, label: labelStr });
   }
   return out;
 }
@@ -136,7 +171,7 @@ export function deriveEffortsForModel(modelId: string): string[] | null {
   if (id === 'gemini-3.1-pro' || id.startsWith('gemini-3.1-pro')) {
     return ['low', 'high']
   }
-  if (id.startsWith('gemini-3.')) {
+  if (/^gemini-(?:[3-9]|\d{2,})(?:[.-]|$)/i.test(id)) {
     return ['low', 'medium', 'high']
   }
   return null
@@ -153,7 +188,10 @@ export function foldEfforts(raw: readonly RawModel[]): CatalogEntry[] {
   const slugSet = new Set(raw.map((r) => r.slug))
   for (const r of raw) {
     if (!r.slug.startsWith('gemini')) {
-      verbatim.push({ id: r.slug, name: r.label, efforts: null, inputModalities: getInputModalitiesForModel(r.slug) });
+      const displayLabel = (r.label && r.label.trim() !== '' && r.label.trim() !== r.slug)
+        ? r.label.trim()
+        : prettifyModelSlug(r.slug)
+      verbatim.push({ id: r.slug, name: displayLabel, efforts: null, inputModalities: getInputModalitiesForModel(r.slug) });
       continue;
     }
 
@@ -161,8 +199,11 @@ export function foldEfforts(raw: readonly RawModel[]): CatalogEntry[] {
       const base = r.slug.slice(0, -7)
       const inferredEfforts = deriveEffortsForModel(base)
       const cleanLabel = stripTieredLabel(r.label)
+      const displayLabel = (cleanLabel !== '' && cleanLabel !== base && cleanLabel !== r.slug)
+        ? cleanLabel
+        : prettifyModelSlug(base)
       const entry = bases.get(base) ?? {
-        label: cleanLabel !== '' ? cleanLabel : base,
+        label: displayLabel,
         efforts: new Set<string>(),
       }
       if (inferredEfforts) {
@@ -186,7 +227,11 @@ export function foldEfforts(raw: readonly RawModel[]): CatalogEntry[] {
           (x) => x.slug.startsWith(base + '-') && EFFORT_SUFFIXES.some((e) => x.slug.endsWith('-' + e)) && x.slug !== r.slug,
         );
         if (hasBare || hasSibling) {
-        const entry = bases.get(base) ?? { label: stripEffortLabel(r.label, eff), efforts: new Set<string>() };
+          const stripped = stripEffortLabel(r.label, eff)
+          const displayLabel = (stripped !== '' && stripped !== base && stripped !== r.slug)
+            ? stripped
+            : prettifyModelSlug(base)
+          const entry = bases.get(base) ?? { label: displayLabel, efforts: new Set<string>() };
           entry.efforts.add(eff)
           bases.set(base, entry)
           folded = true;
@@ -194,14 +239,19 @@ export function foldEfforts(raw: readonly RawModel[]): CatalogEntry[] {
         }
       }
     }
-    if (!folded) verbatim.push({ id: r.slug, name: r.label, efforts: null, inputModalities: getInputModalitiesForModel(r.slug) });
+    if (!folded) {
+      const displayLabel = (r.label && r.label.trim() !== '' && r.label.trim() !== r.slug)
+        ? r.label.trim()
+        : prettifyModelSlug(r.slug)
+      verbatim.push({ id: r.slug, name: displayLabel, efforts: null, inputModalities: getInputModalitiesForModel(r.slug) });
+    }
   }
   const folded: CatalogEntry[] = []
   for (const [id, v] of bases) {
     const efforts = EFFORT_SUFFIXES.filter((e) => v.efforts.has(e));
     folded.push({
       id,
-      name: v.label !== '' ? v.label : id,
+      name: (v.label !== '' && v.label !== id) ? v.label : prettifyModelSlug(id),
       efforts: efforts.length > 0 ? efforts : null,
       inputModalities: getInputModalitiesForModel(id),
     });
@@ -369,6 +419,9 @@ export class ModelCatalog {
 
 export function resolveModelSlug(id: string): string {
   const s = id.trim().toLowerCase()
+  if (s === 'gemini-4' || s === 'gemini-4.0') {
+    return 'gemini-4-flash'
+  }
   if (
     s === 'claude-opus-4-6' ||
     s === 'claude-opus-4-8' ||
@@ -578,7 +631,7 @@ export function getAntigravityRequestModelId(modelId: string, effort?: string): 
       resolvedId.endsWith('-tiered') ||
       resolvedId.endsWith('-extra-low') ||
       resolvedId.endsWith('-thinking')
-    if (resolvedId.startsWith('gemini-3.') && !isWireModel) {
+    if (/^gemini-(?:[3-9]|\d{2,})(?:[.-]|$)/i.test(resolvedId) && !isWireModel) {
       if (effort && effort !== 'off' && ['low', 'medium', 'high', 'xhigh'].includes(effort.toLowerCase())) {
         const eff = effort.toLowerCase() === 'xhigh' ? 'high' : effort.toLowerCase()
         return `${resolvedId}-${eff}`
@@ -605,6 +658,15 @@ export function getAntigravityRequestModelId(modelId: string, effort?: string): 
 }
 
 export function getFallbackRuntimeModel(runtimeModel: string, effort?: string): string | undefined {
+  if (runtimeModel === 'gemini-4-flash-tiered') {
+    return getAntigravityRequestModelId('gemini-3.8-flash', effort)
+  }
+  if (runtimeModel.startsWith('gemini-4-flash-')) {
+    return runtimeModel.replace('gemini-4-flash-', 'gemini-3.8-flash-')
+  }
+  if (runtimeModel === 'gemini-4-flash') {
+    return 'gemini-3.8-flash-low'
+  }
   if (runtimeModel === 'gemini-3.8-flash-tiered') {
     return getAntigravityRequestModelId('gemini-3.7-flash', effort)
   }
@@ -645,7 +707,7 @@ export function getThinkingConfig(modelId: string, effort?: string): ThinkingWir
     modelId === 'gemini-3.8-flash' ||
     modelId === 'gemini-3.7-flash' ||
     modelId === 'gemini-3.6-flash' ||
-    (modelId.startsWith('gemini-3.') &&
+    (/^gemini-(?:[3-9]|\d{2,})(?:[.-]|$)/i.test(modelId) &&
       !modelId.startsWith('gemini-3.5') &&
       !modelId.startsWith('gemini-3.1'))
   ) {
