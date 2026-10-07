@@ -419,9 +419,6 @@ export class ModelCatalog {
 
 export function resolveModelSlug(id: string): string {
   const s = id.trim().toLowerCase()
-  if (s === 'gemini-4' || s === 'gemini-4.0') {
-    return 'gemini-4-flash'
-  }
   if (
     s === 'claude-opus-4-6' ||
     s === 'claude-opus-4-8' ||
@@ -658,15 +655,6 @@ export function getAntigravityRequestModelId(modelId: string, effort?: string): 
 }
 
 export function getFallbackRuntimeModel(runtimeModel: string, effort?: string): string | undefined {
-  if (runtimeModel === 'gemini-4-flash-tiered') {
-    return getAntigravityRequestModelId('gemini-3.8-flash', effort)
-  }
-  if (runtimeModel.startsWith('gemini-4-flash-')) {
-    return runtimeModel.replace('gemini-4-flash-', 'gemini-3.8-flash-')
-  }
-  if (runtimeModel === 'gemini-4-flash') {
-    return 'gemini-3.8-flash-low'
-  }
   if (runtimeModel === 'gemini-3.8-flash-tiered') {
     return getAntigravityRequestModelId('gemini-3.7-flash', effort)
   }
