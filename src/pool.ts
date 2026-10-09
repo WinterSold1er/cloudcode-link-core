@@ -187,17 +187,21 @@ export class AccountPoolManager {
     if (primary.systemHome) return
     primary.dir = ''
     primary.systemHome = true
-    primary.alias = '主账号 (系统登录)'
+    if (!primary.alias || /^主账号/i.test(primary.alias) || /^备用.*账号/i.test(primary.alias)) {
+      primary.alias = primary.email || '主账号 (系统登录)'
+    }
     this.data.primaryAccountId = primary.id
     this.persist()
   }
 
-  private normalizeAccountAliases(): void {
+  normalizeAccountAliases(): void {
     let changed = false
     for (const acc of this.data.accounts) {
-      if (acc.email && (!acc.alias || /^备用.*账号/i.test(acc.alias) || /^主账号/i.test(acc.alias))) {
-        acc.alias = acc.email
-        changed = true
+      if (acc.email && (!acc.alias || /^备用.*账号/i.test(acc.alias) || /^主账号/i.test(acc.alias) || acc.alias === acc.id)) {
+        if (acc.alias !== acc.email) {
+          acc.alias = acc.email
+          changed = true
+        }
       }
     }
     if (changed) this.persist()
@@ -366,9 +370,11 @@ export class AccountPoolManager {
       chmodSync(tokenDir, 0o700)
     } catch {}
 
+    const isAutoName = !alias || /^备用.*账号/i.test(alias) || /^主账号/i.test(alias)
+    const effectiveAlias = isAutoName ? id : alias
     const newAccount: ManagedAccount = {
       id,
-      alias: alias || id,
+      alias: effectiveAlias,
       dir,
       enabled: true,
       createdAt: Date.now(),
@@ -423,7 +429,8 @@ export class AccountPoolManager {
   setAccountAlias(id: string, alias: string): boolean {
     const acc = this.getAccount(id)
     if (!acc) return false
-    acc.alias = alias.trim()
+    const trimmed = alias.trim()
+    acc.alias = trimmed || acc.email || acc.id
     this.persist()
     return true
   }
@@ -470,13 +477,14 @@ export class AccountPoolManager {
     const acc = this.getAccount(id)
     if (!acc) return
     acc.email = newEmail
-    if (!acc.alias || /^备用.*账号/i.test(acc.alias) || /^主账号/i.test(acc.alias)) {
+    if (!acc.alias || /^备用.*账号/i.test(acc.alias) || /^主账号/i.test(acc.alias) || acc.alias === acc.id) {
       acc.alias = newEmail
     }
     acc.cooldowns = {}
     acc.quotas = {}
     delete acc.authRequired
     delete acc.authError
+    this.normalizeAccountAliases()
     this.persist()
   }
 
@@ -571,10 +579,11 @@ export class AccountPoolManager {
     }
     if (email) {
       acc.email = email
-      if (!acc.alias || /^备用.*账号/i.test(acc.alias) || /^主账号/i.test(acc.alias)) {
+      if (!acc.alias || /^备用.*账号/i.test(acc.alias) || /^主账号/i.test(acc.alias) || acc.alias === acc.id) {
         acc.alias = email
       }
     }
+    this.normalizeAccountAliases()
     this.persist()
   }
 
