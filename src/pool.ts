@@ -71,6 +71,7 @@ export class AccountPoolManager {
     this.data = this.load()
     this.bootstrapDefaultAccount()
     this.normalizeLegacyPrimary()
+    this.normalizeAccountAliases()
   }
 
   getBaseDir(): string {
@@ -191,6 +192,17 @@ export class AccountPoolManager {
     this.persist()
   }
 
+  private normalizeAccountAliases(): void {
+    let changed = false
+    for (const acc of this.data.accounts) {
+      if (acc.email && (!acc.alias || /^备用.*账号/i.test(acc.alias) || /^主账号/i.test(acc.alias))) {
+        acc.alias = acc.email
+        changed = true
+      }
+    }
+    if (changed) this.persist()
+  }
+
   getPoolData(): Readonly<AccountPoolData> {
     return this.data
   }
@@ -259,10 +271,11 @@ export class AccountPoolManager {
     } catch {
       // If rename fails, keep dir
     }
-    const count = this.data.accounts.length + 1
+    const isAutoName = !alias || /^备用.*账号/i.test(alias) || /^主账号/i.test(alias)
+    const effectiveAlias = isAutoName ? (email || id) : alias
     const newAccount: ManagedAccount = {
       id,
-      alias: alias || `备用 Google 账号 ${count}`,
+      alias: effectiveAlias,
       dir: existsSync(finalDir) ? finalDir : dir,
       ...(email ? { email } : {}),
       ...(proxyUrl ? { proxyUrl } : {}),
@@ -353,10 +366,9 @@ export class AccountPoolManager {
       chmodSync(tokenDir, 0o700)
     } catch {}
 
-    const count = this.data.accounts.length + 1
     const newAccount: ManagedAccount = {
       id,
-      alias: alias || `备用账号 ${count} (Account ${count})`,
+      alias: alias || id,
       dir,
       enabled: true,
       createdAt: Date.now(),
@@ -458,6 +470,9 @@ export class AccountPoolManager {
     const acc = this.getAccount(id)
     if (!acc) return
     acc.email = newEmail
+    if (!acc.alias || /^备用.*账号/i.test(acc.alias) || /^主账号/i.test(acc.alias)) {
+      acc.alias = newEmail
+    }
     acc.cooldowns = {}
     acc.quotas = {}
     delete acc.authRequired
@@ -554,7 +569,12 @@ export class AccountPoolManager {
       ...acc.quotas,
       ...quotas,
     }
-    if (email) acc.email = email
+    if (email) {
+      acc.email = email
+      if (!acc.alias || /^备用.*账号/i.test(acc.alias) || /^主账号/i.test(acc.alias)) {
+        acc.alias = email
+      }
+    }
     this.persist()
   }
 
