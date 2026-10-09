@@ -50,6 +50,7 @@ export class Semaphore {
 
 export class AccountPoolManager {
   private data: AccountPoolData
+  private isBrandNew = false
   private readonly baseDir: string
   private readonly file: string
   private readonly activeMemoryTokens = new Map<string, { token: string; expiresAt: number }>()
@@ -88,12 +89,14 @@ export class AccountPoolManager {
 
   private load(): AccountPoolData {
     if (!existsSync(this.file)) {
+      this.isBrandNew = true
       return defaultPoolData()
     }
     const raw = readFileSync(this.file, 'utf8')
     try {
       const parsed = JSON.parse(raw) as AccountPoolData
       if (parsed && Array.isArray(parsed.accounts)) {
+        this.isBrandNew = false
         return {
           ...defaultPoolData(),
           ...parsed,
@@ -112,6 +115,7 @@ export class AccountPoolManager {
           renameSync(this.file, `${this.file}.corrupted.${Date.now()}`)
         } catch {}
       }
+      this.isBrandNew = true
       const empty = defaultPoolData()
       this.data = empty
       return empty
@@ -150,6 +154,7 @@ export class AccountPoolManager {
    * Bootstraps the primary account on first start.
    */
   private bootstrapDefaultAccount(): void {
+    if (!this.isBrandNew) return
     const hasSystemHome = this.data.accounts.some((a) => a.systemHome)
     if (hasSystemHome) return
 
@@ -171,7 +176,14 @@ export class AccountPoolManager {
 
   private normalizeLegacyPrimary(): void {
     const primary = this.data.accounts.find((a) => a.id === 'acc_primary')
-    if (!primary || primary.systemHome) return
+    if (!primary) {
+      if (this.data.primaryAccountId && !this.data.accounts.some((a) => a.id === this.data.primaryAccountId)) {
+        this.data.primaryAccountId = this.data.accounts[0]?.id
+        this.persist()
+      }
+      return
+    }
+    if (primary.systemHome) return
     primary.dir = ''
     primary.systemHome = true
     primary.alias = '主账号 (系统登录)'
@@ -371,7 +383,7 @@ export class AccountPoolManager {
       }
     }
     if (this.data.primaryAccountId === id) {
-      this.data.primaryAccountId = undefined
+      this.data.primaryAccountId = this.data.accounts[0]?.id
     }
     if (this.data.pinnedAccountId === id) {
       this.data.pinnedAccountId = undefined

@@ -569,7 +569,7 @@ test('isInternalModel identifies internal editor, tab, and chat preview models',
 
 test('getFallbackRuntimeModel supports Gemini 3.8 failover to 3.7', () => {
   assert.equal(getFallbackRuntimeModel('gemini-3.8-flash'), 'gemini-3.7-flash-low')
-  assert.equal(getFallbackRuntimeModel('gemini-3.8-flash-high'), 'gemini-3.8-flash-high')
+  assert.equal(getFallbackRuntimeModel('gemini-3.8-flash-high'), 'gemini-3.7-flash-high')
   assert.equal(getFallbackRuntimeModel('gemini-3.8-flash-tiered', 'high'), 'gemini-3.7-flash-high')
   assert.equal(getFallbackRuntimeModel('gemini-3.8-flash-tiered'), 'gemini-3.7-flash-low')
 })

@@ -438,6 +438,13 @@ export class SqliteStatsStorage implements IStatsStorage {
     if (filter?.limit !== undefined && filter.limit >= 0) {
       query += ' LIMIT ?'
       params.push(filter.limit)
+      if (filter?.offset !== undefined && filter.offset >= 0) {
+        query += ' OFFSET ?'
+        params.push(filter.offset)
+      }
+    } else if (filter?.offset !== undefined && filter.offset >= 0) {
+      query += ' LIMIT -1 OFFSET ?'
+      params.push(filter.offset)
     }
 
     const stmt = this.db.prepare(query)
@@ -454,6 +461,23 @@ export class SqliteStatsStorage implements IStatsStorage {
       totalCachedTokens: Number(r.totalCachedTokens),
       cacheHitRate: Number(r.cacheHitRate),
     }))
+  }
+
+  async countSessions(filter?: SessionMetricFilter): Promise<number> {
+    this.assertNotClosed()
+    if (!this.db) return 0
+
+    let query = 'SELECT COUNT(*) as count FROM session_metrics WHERE 1=1'
+    const params: any[] = []
+
+    if (filter?.accountId) {
+      query += ' AND accountId = ?'
+      params.push(filter.accountId)
+    }
+
+    const stmt = this.db.prepare(query)
+    const row = stmt.get(...params) as any
+    return Number(row?.count ?? 0)
   }
 
   async getOverviewMetrics(): Promise<OverviewMetricsResult> {

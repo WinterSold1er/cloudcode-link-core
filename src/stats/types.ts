@@ -184,6 +184,7 @@ export interface IStatsStorage {
   queryRequests?(filter?: RequestMetricFilter): Promise<RequestMetric[]>
   querySessions?(filter?: SessionMetricFilter): Promise<SessionMetric[]>
   countRequests?(filter?: RequestMetricFilter): Promise<number>
+  countSessions?(filter?: SessionMetricFilter): Promise<number>
   getOverviewMetrics?(): Promise<OverviewMetricsResult>
   getAccountUsage?(): Promise<AccountUsageMetric[]>
   getAggregatedMetrics?(

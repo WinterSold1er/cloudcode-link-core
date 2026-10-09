@@ -998,3 +998,213 @@ test('StatsCollector: end-to-end with persistent sqlite database path', async ()
     }
   }
 })
+
+test('MemoryStatsStorage: countSessions and querySessions pagination with offset', async () => {
+  const storage = new MemoryStatsStorage()
+  await storage.init()
+
+  const sessions: SessionMetric[] = [
+    {
+      sessionId: 'sess-1',
+      accountId: 'acc-1',
+      createdAt: 1000,
+      updatedAt: 1000,
+      totalRequests: 1,
+      totalSuccess: 1,
+      totalFailed: 0,
+      totalPromptTokens: 100,
+      totalCachedTokens: 20,
+      cacheHitRate: 0.2,
+    },
+    {
+      sessionId: 'sess-2',
+      accountId: 'acc-1',
+      createdAt: 2000,
+      updatedAt: 2000,
+      totalRequests: 2,
+      totalSuccess: 2,
+      totalFailed: 0,
+      totalPromptTokens: 200,
+      totalCachedTokens: 40,
+      cacheHitRate: 0.2,
+    },
+    {
+      sessionId: 'sess-3',
+      accountId: 'acc-2',
+      createdAt: 3000,
+      updatedAt: 3000,
+      totalRequests: 3,
+      totalSuccess: 3,
+      totalFailed: 0,
+      totalPromptTokens: 300,
+      totalCachedTokens: 60,
+      cacheHitRate: 0.2,
+    },
+    {
+      sessionId: 'sess-4',
+      accountId: 'acc-1',
+      createdAt: 4000,
+      updatedAt: 4000,
+      totalRequests: 4,
+      totalSuccess: 4,
+      totalFailed: 0,
+      totalPromptTokens: 400,
+      totalCachedTokens: 80,
+      cacheHitRate: 0.2,
+    },
+    {
+      sessionId: 'sess-5',
+      accountId: 'acc-2',
+      createdAt: 5000,
+      updatedAt: 5000,
+      totalRequests: 5,
+      totalSuccess: 5,
+      totalFailed: 0,
+      totalPromptTokens: 500,
+      totalCachedTokens: 100,
+      cacheHitRate: 0.2,
+    },
+  ]
+
+  await storage.upsertSessionMetrics!(sessions)
+
+  // countSessions tests
+  assert.equal(typeof storage.countSessions, 'function')
+  assert.equal(await storage.countSessions!(), 5)
+  assert.equal(await storage.countSessions!({ accountId: 'acc-1' }), 3)
+  assert.equal(await storage.countSessions!({ accountId: 'acc-2' }), 2)
+  assert.equal(await storage.countSessions!({ accountId: 'acc-unknown' }), 0)
+
+  // querySessions pagination tests (sorted by updatedAt DESC: sess-5, sess-4, sess-3, sess-2, sess-1)
+  const page1 = await storage.querySessions({ limit: 2, offset: 0 })
+  assert.equal(page1.length, 2)
+  assert.equal(page1[0]?.sessionId, 'sess-5')
+  assert.equal(page1[1]?.sessionId, 'sess-4')
+
+  const page2 = await storage.querySessions({ limit: 2, offset: 2 })
+  assert.equal(page2.length, 2)
+  assert.equal(page2[0]?.sessionId, 'sess-3')
+  assert.equal(page2[1]?.sessionId, 'sess-2')
+
+  const page3 = await storage.querySessions({ limit: 2, offset: 4 })
+  assert.equal(page3.length, 1)
+  assert.equal(page3[0]?.sessionId, 'sess-1')
+
+  const pageOut = await storage.querySessions({ limit: 2, offset: 10 })
+  assert.equal(pageOut.length, 0)
+
+  // querySessions with accountId and pagination: acc-1 has sess-4, sess-2, sess-1
+  const acc1Page = await storage.querySessions({ accountId: 'acc-1', limit: 2, offset: 1 })
+  assert.equal(acc1Page.length, 2)
+  assert.equal(acc1Page[0]?.sessionId, 'sess-2')
+  assert.equal(acc1Page[1]?.sessionId, 'sess-1')
+
+  await storage.close()
+})
+
+test('SqliteStatsStorage: countSessions and querySessions pagination with offset', async () => {
+  if (!isSqliteAvailable()) {
+    return
+  }
+
+  const storage = new SqliteStatsStorage(':memory:')
+  await storage.init()
+
+  const sessions: SessionMetric[] = [
+    {
+      sessionId: 'sess-1',
+      accountId: 'acc-1',
+      createdAt: 1000,
+      updatedAt: 1000,
+      totalRequests: 1,
+      totalSuccess: 1,
+      totalFailed: 0,
+      totalPromptTokens: 100,
+      totalCachedTokens: 20,
+      cacheHitRate: 0.2,
+    },
+    {
+      sessionId: 'sess-2',
+      accountId: 'acc-1',
+      createdAt: 2000,
+      updatedAt: 2000,
+      totalRequests: 2,
+      totalSuccess: 2,
+      totalFailed: 0,
+      totalPromptTokens: 200,
+      totalCachedTokens: 40,
+      cacheHitRate: 0.2,
+    },
+    {
+      sessionId: 'sess-3',
+      accountId: 'acc-2',
+      createdAt: 3000,
+      updatedAt: 3000,
+      totalRequests: 3,
+      totalSuccess: 3,
+      totalFailed: 0,
+      totalPromptTokens: 300,
+      totalCachedTokens: 60,
+      cacheHitRate: 0.2,
+    },
+    {
+      sessionId: 'sess-4',
+      accountId: 'acc-1',
+      createdAt: 4000,
+      updatedAt: 4000,
+      totalRequests: 4,
+      totalSuccess: 4,
+      totalFailed: 0,
+      totalPromptTokens: 400,
+      totalCachedTokens: 80,
+      cacheHitRate: 0.2,
+    },
+    {
+      sessionId: 'sess-5',
+      accountId: 'acc-2',
+      createdAt: 5000,
+      updatedAt: 5000,
+      totalRequests: 5,
+      totalSuccess: 5,
+      totalFailed: 0,
+      totalPromptTokens: 500,
+      totalCachedTokens: 100,
+      cacheHitRate: 0.2,
+    },
+  ]
+
+  await storage.upsertSessionMetrics(sessions)
+
+  // countSessions tests
+  assert.equal(typeof storage.countSessions, 'function')
+  assert.equal(await storage.countSessions!(), 5)
+  assert.equal(await storage.countSessions!({ accountId: 'acc-1' }), 3)
+  assert.equal(await storage.countSessions!({ accountId: 'acc-2' }), 2)
+  assert.equal(await storage.countSessions!({ accountId: 'acc-unknown' }), 0)
+
+  // querySessions pagination tests (sorted by updatedAt DESC: sess-5, sess-4, sess-3, sess-2, sess-1)
+  const page1 = await storage.querySessions({ limit: 2, offset: 0 })
+  assert.equal(page1.length, 2)
+  assert.equal(page1[0]?.sessionId, 'sess-5')
+  assert.equal(page1[1]?.sessionId, 'sess-4')
+
+  const page2 = await storage.querySessions({ limit: 2, offset: 2 })
+  assert.equal(page2.length, 2)
+  assert.equal(page2[0]?.sessionId, 'sess-3')
+  assert.equal(page2[1]?.sessionId, 'sess-2')
+
+  const page3 = await storage.querySessions({ limit: 2, offset: 4 })
+  assert.equal(page3.length, 1)
+  assert.equal(page3[0]?.sessionId, 'sess-1')
+
+  const pageOut = await storage.querySessions({ limit: 2, offset: 10 })
+  assert.equal(pageOut.length, 0)
+
+  // querySessions with accountId and pagination
+  const acc1Page = await storage.querySessions({ accountId: 'acc-1', limit: 2, offset: 1 })
+  assert.equal(acc1Page.length, 2)
+  assert.equal(acc1Page[0]?.sessionId, 'sess-2')
+  assert.equal(acc1Page[1]?.sessionId, 'sess-1')
+
+  await storage.close()
+})

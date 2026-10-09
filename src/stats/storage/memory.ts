@@ -184,10 +184,23 @@ export class MemoryStatsStorage implements IStatsStorage {
       list = list.filter((s) => s.accountId === filter.accountId)
     }
     list.sort((a, b) => b.updatedAt - a.updatedAt)
+    const offset = filter?.offset !== undefined && filter.offset >= 0 ? filter.offset : 0
+    if (offset > 0) {
+      list = list.slice(offset)
+    }
     if (filter?.limit !== undefined && filter.limit >= 0) {
       list = list.slice(0, filter.limit)
     }
     return list.map((s) => ({ ...s }))
+  }
+
+  async countSessions(filter?: SessionMetricFilter): Promise<number> {
+    this.assertNotClosed()
+    let list = Array.from(this.sessions.values())
+    if (filter?.accountId) {
+      list = list.filter((s) => s.accountId === filter.accountId)
+    }
+    return list.length
   }
 
   async getOverviewMetrics(): Promise<OverviewMetricsResult> {
