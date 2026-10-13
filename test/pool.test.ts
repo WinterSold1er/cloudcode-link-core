@@ -129,7 +129,7 @@ test('Sequential Drain: family-scoped rate limit fallback', () => {
   assert.equal(pool.selectAccount('anthropic')?.id, accA.id)
 })
 
-test('Quota-Aware Selection: picks account with highest remainingFraction', () => {
+test('Round-Robin Selection: rotates strictly in sequence (A -> B -> C -> A) even with different quotas', () => {
   const dir = mkdtempSync(join(tmpdir(), 'agy-pool-quota-'))
   const pool = new AccountPoolManager(dir)
   pool.setMode('round-robin')
@@ -137,40 +137,46 @@ test('Quota-Aware Selection: picks account with highest remainingFraction', () =
   const accB = pool.createAccountSlot('Account B')
   const accC = pool.createAccountSlot('Account C')
 
-  // Set different quota fractions
+  // Set different quota fractions (all healthy > 0.05)
   pool.updateAccountQuotas(accA.id, { google: { remainingFraction: 0.2 } })
   pool.updateAccountQuotas(accB.id, { google: { remainingFraction: 0.8 } })
   pool.updateAccountQuotas(accC.id, { google: { remainingFraction: 0.5 } })
 
-  // Should pick Account B (highest remaining: 0.8)
+  // Strict round-robin rotation regardless of quota difference: A -> B -> C -> A -> B -> C
+  assert.equal(pool.selectAccount('google')?.id, accA.id)
   assert.equal(pool.selectAccount('google')?.id, accB.id)
-
-  // Reduce B's quota below C
-  pool.updateAccountQuotas(accB.id, { google: { remainingFraction: 0.3 } })
-
-  // Now C has highest (0.5)
+  assert.equal(pool.selectAccount('google')?.id, accC.id)
+  assert.equal(pool.selectAccount('google')?.id, accA.id)
+  assert.equal(pool.selectAccount('google')?.id, accB.id)
   assert.equal(pool.selectAccount('google')?.id, accC.id)
 
-  // Set A highest
+  // Modifying quota values does not break round-robin order as long as accounts remain healthy
+  pool.updateAccountQuotas(accB.id, { google: { remainingFraction: 0.3 } })
   pool.updateAccountQuotas(accA.id, { google: { remainingFraction: 0.9 } })
+
   assert.equal(pool.selectAccount('google')?.id, accA.id)
+  assert.equal(pool.selectAccount('google')?.id, accB.id)
+  assert.equal(pool.selectAccount('google')?.id, accC.id)
 })
 
-test('Quota-Aware Selection: undefined quota treated as 1.0 (full)', () => {
+test('Round-Robin Selection: handles mixed defined and undefined quotas in sequence', () => {
   const dir = mkdtempSync(join(tmpdir(), 'agy-pool-quota-undef-'))
   const pool = new AccountPoolManager(dir)
   pool.setMode('round-robin')
   const accA = pool.getAccounts()[0]!
   const accB = pool.createAccountSlot('Account B')
 
-  // Only accA has quota data; accB has none (treated as 1.0)
+  // Only accA has quota data (0.5); accB has none (treated as undefined/full)
   pool.updateAccountQuotas(accA.id, { google: { remainingFraction: 0.5 } })
 
-  // accB should be picked (implicit 1.0 > 0.5)
+  // Alternates A -> B -> A -> B in round-robin sequence
+  assert.equal(pool.selectAccount('google')?.id, accA.id)
+  assert.equal(pool.selectAccount('google')?.id, accB.id)
+  assert.equal(pool.selectAccount('google')?.id, accA.id)
   assert.equal(pool.selectAccount('google')?.id, accB.id)
 })
 
-test('Quota-Aware Selection: equal fraction rotates in round-robin order', () => {
+test('Round-Robin Selection: equal fraction rotates in round-robin order', () => {
   const dir = mkdtempSync(join(tmpdir(), 'agy-pool-quota-eq-'))
   const pool = new AccountPoolManager(dir)
   pool.setMode('round-robin')
@@ -190,28 +196,113 @@ test('Quota-Aware Selection: equal fraction rotates in round-robin order', () =>
   assert.equal(pool.selectAccount('google')?.id, accA.id)
 })
 
-test('Quota-Aware Selection: cooldown account skipped, picks next highest quota', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'agy-pool-quota-cd-'))
+test('Round-Robin Selection: skips unhealthy account due to cooldown or exhausted quota, and resumes when healthy', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agy-pool-rr-unhealthy-'))
   const pool = new AccountPoolManager(dir)
   pool.setMode('round-robin')
   const accA = pool.getAccounts()[0]!
   const accB = pool.createAccountSlot('Account B')
+  const accC = pool.createAccountSlot('Account C')
 
-  pool.updateAccountQuotas(accA.id, { google: { remainingFraction: 0.9 } })
-  pool.updateAccountQuotas(accB.id, { google: { remainingFraction: 0.3 } })
-
-  // accA is best
+  // Normal rotation: A -> B
   assert.equal(pool.selectAccount('google')?.id, accA.id)
-
-  // accA hits 429 → cooldown
-  pool.recordFailure(accA.id, 'google', '429 Rate Limit')
-
-  // accB is the only healthy candidate
   assert.equal(pool.selectAccount('google')?.id, accB.id)
 
-  // Clear cooldown → accA back with higher quota
-  pool.clearCooldown(accA.id, 'google')
+  // AccC quota exhausted with reset in the future -> becomes unhealthy
+  pool.updateAccountQuotas(accC.id, {
+    google: {
+      remainingFraction: 0.0,
+      resetTime: new Date(Date.now() + 60_000).toISOString(),
+    },
+  })
+
+  // Round-robin skips AccC and selects AccA, then AccB
   assert.equal(pool.selectAccount('google')?.id, accA.id)
+  assert.equal(pool.selectAccount('google')?.id, accB.id)
+
+  // AccB hits rate limit (429) -> enters cooldown
+  pool.recordFailure(accB.id, 'google', '429 Rate Limit')
+
+  // Now only AccA is healthy
+  assert.equal(pool.selectAccount('google')?.id, accA.id)
+  assert.equal(pool.selectAccount('google')?.id, accA.id)
+
+  // AccC quota recovers
+  pool.updateAccountQuotas(accC.id, {
+    google: {
+      remainingFraction: 0.7,
+    },
+  })
+
+  // Active was AccA; AccB is still in cooldown; AccC is now healthy -> selects AccC then AccA
+  assert.equal(pool.selectAccount('google')?.id, accC.id)
+  assert.equal(pool.selectAccount('google')?.id, accA.id)
+
+  // AccB cooldown cleared -> all three healthy again
+  pool.clearCooldown(accB.id, 'google')
+
+  // Next from AccA is AccB, then AccC, then AccA
+  assert.equal(pool.selectAccount('google')?.id, accB.id)
+  assert.equal(pool.selectAccount('google')?.id, accC.id)
+  assert.equal(pool.selectAccount('google')?.id, accA.id)
+})
+
+test('Round-Robin Selection: independent rotation across multiple model families', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agy-pool-rr-multifamily-'))
+  const pool = new AccountPoolManager(dir)
+  pool.setMode('round-robin')
+  const accA = pool.getAccounts()[0]!
+  const accB = pool.createAccountSlot('Account B')
+  const accC = pool.createAccountSlot('Account C')
+
+  // Google sequence: A -> B
+  assert.equal(pool.selectAccount('google')?.id, accA.id)
+  assert.equal(pool.selectAccount('google')?.id, accB.id)
+
+  // Anthropic starts fresh: A
+  assert.equal(pool.selectAccount('anthropic')?.id, accA.id)
+
+  // Google continues to C: C
+  assert.equal(pool.selectAccount('google')?.id, accC.id)
+
+  // Anthropic continues to B: B
+  assert.equal(pool.selectAccount('anthropic')?.id, accB.id)
+
+  // Google wraps to A: A
+  assert.equal(pool.selectAccount('google')?.id, accA.id)
+
+  // Anthropic continues to C, then wraps to A: C -> A
+  assert.equal(pool.selectAccount('anthropic')?.id, accC.id)
+  assert.equal(pool.selectAccount('anthropic')?.id, accA.id)
+})
+
+test('Round-Robin Selection: pinned account takes precedence over round-robin when healthy', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agy-pool-rr-pinned-'))
+  const pool = new AccountPoolManager(dir)
+  pool.setMode('round-robin')
+  const accA = pool.getAccounts()[0]!
+  const accB = pool.createAccountSlot('Account B')
+  const accC = pool.createAccountSlot('Account C')
+
+  pool.pinAccount(accB.id)
+
+  // Pinned account AccB is always chosen while healthy
+  assert.equal(pool.selectAccount('google')?.id, accB.id)
+  assert.equal(pool.selectAccount('google')?.id, accB.id)
+
+  // AccB hits rate limit -> enters cooldown (unhealthy)
+  pool.recordFailure(accB.id, 'google', '429 Rate Limit')
+
+  // Falls back to round-robin among healthy accounts [AccA, AccC]
+  // Active was AccB (index 1), next is AccC (index 2)
+  assert.equal(pool.selectAccount('google')?.id, accC.id)
+  assert.equal(pool.selectAccount('google')?.id, accA.id)
+  assert.equal(pool.selectAccount('google')?.id, accC.id)
+
+  // AccB recovers -> pinned preference resumes immediately
+  pool.clearCooldown(accB.id, 'google')
+  assert.equal(pool.selectAccount('google')?.id, accB.id)
+  assert.equal(pool.selectAccount('google')?.id, accB.id)
 })
 
 test('Sticky Sequential Drain: stays on current active account until it runs out', () => {

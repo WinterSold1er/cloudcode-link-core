@@ -656,13 +656,25 @@ export class AccountPoolManager {
     if (quota && typeof quota.remainingFraction === 'number' && quota.remainingFraction <= threshold) {
       if (quota.resetTime) {
         const resetMs = Date.parse(quota.resetTime)
-        if (!Number.isNaN(resetMs) && resetMs > now) return false
+        if (!Number.isNaN(resetMs) && resetMs <= now) {
+          // Reset time has passed, quota is refreshed
+        } else {
+          return false
+        }
+      } else {
+        return false
       }
     }
     if (quota && typeof quota.weeklyFraction === 'number' && quota.weeklyFraction <= 0.01) {
       if (quota.weeklyResetTime) {
         const resetMs = Date.parse(quota.weeklyResetTime)
-        if (!Number.isNaN(resetMs) && resetMs > now) return false
+        if (!Number.isNaN(resetMs) && resetMs <= now) {
+          // Reset time has passed
+        } else {
+          return false
+        }
+      } else {
+        return false
       }
     }
     return true
@@ -680,28 +692,29 @@ export class AccountPoolManager {
       return pinned
     }
 
-    // Round-robin: Quota-Aware Selection — pick account with highest 5H remaining quota,
-    // rotate in round-robin order when quotas are equal (e.g. all accounts at 100%).
-    if (this.data.mode === 'round-robin' && candidates.length > 1) {
+    // Round-robin: True Round-Robin — rotate strictly in circular order through healthy accounts
+    if (this.data.mode === 'round-robin') {
+      if (candidates.length === 1) {
+        const chosen = candidates[0]!
+        this.runtimeActiveAccountIds.set(family, chosen.id)
+        return chosen
+      }
+
       const activeId = this.runtimeActiveAccountIds.get(family) ?? this.data.activeAccountIds?.[family]
       const lastIndex = activeId ? this.data.accounts.findIndex((a) => a.id === activeId) : -1
       const total = this.data.accounts.length
 
-      const sorted = candidates.slice().sort((a, b) => {
-        const aFrac = a.quotas[family]?.remainingFraction ?? 1.0
-        const bFrac = b.quotas[family]?.remainingFraction ?? 1.0
-        if (Math.abs(bFrac - aFrac) >= 0.001) {
-          return bFrac - aFrac // descending: most remaining first
+      let chosen: ManagedAccount = candidates[0]!
+      if (lastIndex !== -1) {
+        for (let i = 1; i <= total; i++) {
+          const checkAcc = this.data.accounts[(lastIndex + i) % total]!
+          if (candidates.some((c) => c.id === checkAcc.id)) {
+            chosen = checkAcc
+            break
+          }
         }
+      }
 
-        // Equal fraction: rotate in circular order after the last active account
-        const aIndex = this.data.accounts.indexOf(a)
-        const bIndex = this.data.accounts.indexOf(b)
-        const aDist = lastIndex !== -1 ? (aIndex - lastIndex - 1 + total) % total : aIndex
-        const bDist = lastIndex !== -1 ? (bIndex - lastIndex - 1 + total) % total : bIndex
-        return aDist - bDist
-      })
-      const chosen = sorted[0]!
       this.runtimeActiveAccountIds.set(family, chosen.id)
       return chosen
     }
