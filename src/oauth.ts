@@ -33,7 +33,11 @@ export const OAUTH_USERINFO_URL = 'https://www.googleapis.com/oauth2/v1/userinfo
 
 export const OAUTH_CALLBACK_PORT = 51121
 export const OAUTH_CALLBACK_PATH = '/oauth-callback'
-export const OAUTH_REDIRECT_URI = `http://localhost:${OAUTH_CALLBACK_PORT}${OAUTH_CALLBACK_PATH}`
+/** Redirect URI for the registered callback port; overridable so a listener can bind an isolated port. */
+export function oauthRedirectUri(port: number = OAUTH_CALLBACK_PORT): string {
+  return `http://localhost:${port}${OAUTH_CALLBACK_PATH}`
+}
+export const OAUTH_REDIRECT_URI = oauthRedirectUri()
 
 export const AGY_ENDPOINTS: readonly string[] = [
   'https://cloudcode-pa.googleapis.com',
@@ -53,12 +57,12 @@ export function generatePkce(): PkcePair {
   return { verifier, challenge }
 }
 
-export function buildAuthorizeUrl(challenge: string, state: string): string {
+export function buildAuthorizeUrl(challenge: string, state: string, redirectUri: string = OAUTH_REDIRECT_URI): string {
   const { clientId } = resolveClientCredentials()
   const url = new URL(OAUTH_AUTHORIZE_URL)
   url.searchParams.set('client_id', clientId)
   url.searchParams.set('response_type', 'code')
-  url.searchParams.set('redirect_uri', OAUTH_REDIRECT_URI)
+  url.searchParams.set('redirect_uri', redirectUri)
   url.searchParams.set('scope', AGY_SCOPES.join(' '))
   url.searchParams.set('code_challenge', challenge)
   url.searchParams.set('code_challenge_method', 'S256')
@@ -112,12 +116,12 @@ function toTokenSet(payload: TokenEndpointPayload, refreshTokenFallback?: string
 }
 
 /** Exchange an authorization code for tokens (PKCE-verified). */
-export async function exchangeCode(code: string, verifier: string, proxyUrl?: string): Promise<TokenSet> {
+export async function exchangeCode(code: string, verifier: string, proxyUrl?: string, redirectUri: string = OAUTH_REDIRECT_URI): Promise<TokenSet> {
   return toTokenSet(
     await postTokenForm({
       grant_type: 'authorization_code',
       code: code.trim(),
-      redirect_uri: OAUTH_REDIRECT_URI,
+      redirect_uri: redirectUri,
       code_verifier: verifier,
     }, proxyUrl),
   )
@@ -209,7 +213,9 @@ const CALLBACK_SUCCESS_HTML = `<!doctype html><html><head><meta charset="utf-8">
 <p>可以关闭此标签页返回终端或应用。</p>
 </body></html>`
 
-export function startCallbackListener(timeoutMs = 300_000): CallbackHandle {
+export function startCallbackListener(options: { port?: number; timeoutMs?: number } = {}): CallbackHandle {
+  const timeoutMs = options.timeoutMs ?? 300_000
+  const port = options.port ?? OAUTH_CALLBACK_PORT
   let resolveResult!: (value: CallbackResult) => void
   let rejectResult!: (reason: Error) => void
   const result = new Promise<CallbackResult>((resolve, reject) => {
@@ -248,12 +254,12 @@ export function startCallbackListener(timeoutMs = 300_000): CallbackHandle {
   server.on('error', (error: NodeJS.ErrnoException) => {
     rejectResult(
       error.code === 'EADDRINUSE'
-        ? new Error(`port ${OAUTH_CALLBACK_PORT} is busy`)
+        ? new Error(`port ${port} is busy`)
         : error,
     )
   })
 
-  server.listen(OAUTH_CALLBACK_PORT, '127.0.0.1')
+  server.listen(port, '127.0.0.1')
 
   const timeout = setTimeout(() => {
     rejectResult(new Error('timed out waiting for the OAuth callback'))

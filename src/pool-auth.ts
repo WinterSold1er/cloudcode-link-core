@@ -5,6 +5,7 @@ import {
   exchangeCode,
   fetchUserEmail,
   generatePkce,
+  oauthRedirectUri,
   openBrowser,
   parsePastedCode,
   startCallbackListener,
@@ -43,6 +44,8 @@ const DONE_STATUS_TTL_MS = 30_000
 
 export interface PoolAuthFlowDeps {
   openBrowser?: (url: string) => Promise<boolean>
+  /** Callback port; defaults to the registered OAUTH_CALLBACK_PORT. Isolated listeners (tests) pass their own free port. */
+  callbackPort?: number
 }
 
 export class PoolAuthFlow {
@@ -50,6 +53,7 @@ export class PoolAuthFlow {
   private statusValue: PoolAuthStatus = { phase: 'idle' }
   private doneResetTimer: NodeJS.Timeout | null = null
   private readonly open: (url: string) => Promise<boolean>
+  private readonly callbackPort?: number
 
   private readonly pool: AccountPoolManager
   private readonly quota: QuotaService
@@ -65,6 +69,7 @@ export class PoolAuthFlow {
     this.quota = quota
     this.log = log
     this.open = deps.openBrowser ?? openBrowser
+    this.callbackPort = deps.callbackPort
   }
 
   status(): PoolAuthStatus {
@@ -89,9 +94,9 @@ export class PoolAuthFlow {
 
     const { verifier, challenge } = generatePkce()
     const state = randomBytes(16).toString('base64url')
-    const url = buildAuthorizeUrl(challenge, state)
+    const url = buildAuthorizeUrl(challenge, state, oauthRedirectUri(this.callbackPort))
 
-    let listener: CallbackHandle | null = startCallbackListener()
+    let listener: CallbackHandle | null = startCallbackListener({ port: this.callbackPort })
     let bindFailed = false
     await Promise.race([
       listener.result.then(
@@ -173,7 +178,7 @@ export class PoolAuthFlow {
     }
     this.setStatus({ phase: 'exchanging' })
     try {
-      const tokens = await exchangeCode(code, flow.verifier, flow.proxyUrl)
+      const tokens = await exchangeCode(code, flow.verifier, flow.proxyUrl, oauthRedirectUri(this.callbackPort))
       writeAgyTokenFile(flow.dir, tokens)
       const email = await fetchUserEmail(tokens.access_token, flow.proxyUrl)
       if (flow.primary) {
