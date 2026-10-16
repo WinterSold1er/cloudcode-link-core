@@ -20,8 +20,13 @@ export function mergeFallbackFamilyQuota(
   prev: FamilyQuotaInfo | undefined,
   fallback: FamilyQuotaInfo,
 ): FamilyQuotaInfo {
-  if (prev && typeof prev.remainingFraction === 'number') return prev
-  return fallback
+  if (!prev) return fallback
+  return {
+    ...prev,
+    remainingFraction: fallback.remainingFraction ?? prev.remainingFraction,
+    resetTime: fallback.resetTime ?? prev.resetTime,
+    updatedAt: fallback.updatedAt ?? Date.now(),
+  }
 }
 
 export function detectEmailFromAgyLogs(homeDir: string): string | undefined {
@@ -434,6 +439,14 @@ export class QuotaService {
 
     if (options?.summaryOnly) {
       summary = await this.fetchQuotaSummary(accessToken, account.proxyUrl)
+      const hasGoogleInSummary = summary?.groups?.some((g) => {
+        const dName = (g.displayName || '').toLowerCase()
+        const desc = (g.description || '').toLowerCase()
+        return dName.includes('gemini') || desc.includes('gemini')
+      })
+      if (!hasGoogleInSummary) {
+        discovered = await this.fetchAvailableModels(accessToken, account.proxyUrl)
+      }
     } else {
       const [sum, disc] = await Promise.all([
         this.fetchQuotaSummary(accessToken, account.proxyUrl),
@@ -457,6 +470,7 @@ export class QuotaService {
     }
 
     const familyQuotas: Partial<Record<ModelFamily, FamilyQuotaInfo>> = {}
+    const summaryFamilies = new Set<ModelFamily>()
 
     if (summary && Array.isArray(summary.groups)) {
       for (const group of summary.groups) {
@@ -488,6 +502,7 @@ export class QuotaService {
         }
 
         for (const fam of targetFamilies) {
+          summaryFamilies.add(fam)
           familyQuotas[fam] = {
             remainingFraction: fiveHourFrac,
             resetTime: fiveHourReset,
@@ -524,7 +539,7 @@ export class QuotaService {
             resetTime,
             updatedAt: now,
           })
-        } else if (familyQuotas[fam]!.remainingFraction === undefined) {
+        } else if (!summaryFamilies.has(fam) || familyQuotas[fam]!.remainingFraction === undefined) {
           const curRemaining = familyQuotas[fam]!.remainingFraction ?? 1
           if (remaining < curRemaining) {
             familyQuotas[fam]!.remainingFraction = remaining
