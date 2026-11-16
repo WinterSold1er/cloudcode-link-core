@@ -5,8 +5,8 @@ import { fnv1a64Signed } from './sessions.ts'
 
 export const DEFAULT_ENDPOINT = 'https://cloudcode-pa.googleapis.com'
 export const ENDPOINT_FALLBACKS: readonly string[] = [
-  DEFAULT_ENDPOINT,
   'https://daily-cloudcode-pa.googleapis.com',
+  DEFAULT_ENDPOINT,
   'https://daily-cloudcode-pa.sandbox.googleapis.com',
 ]
 
