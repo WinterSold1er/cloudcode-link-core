@@ -1,6 +1,7 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { agyFetch } from './net.ts'
 import { ANTIGRAVITY_MODEL_ENUM } from './models.ts'
+import { buildAgyCliUserAgent } from './quota.ts'
 import { fnv1a64Signed } from './sessions.ts'
 
 export const DEFAULT_ENDPOINT = 'https://cloudcode-pa.googleapis.com'
@@ -109,11 +110,8 @@ export function endpointCandidates(customBaseUrl?: string): string[] {
 }
 
 function defaultUserAgent(): string {
-  const version = process.env.ANTIGRAVITY_HUB_VERSION || '2.8.0'
-  const cl = process.env.ANTIGRAVITY_HUB_CL || '963137146'
-  const os = process.platform === 'darwin' ? 'darwin' : process.platform === 'win32' ? 'windows' : 'linux'
-  const arch = process.arch === 'arm64' ? 'arm64' : 'x64'
-  return `antigravity/hub/${version} (aidev_client; os_type=${os}; arch=${arch}; cl=${cl})`
+  const version = process.env.ANTIGRAVITY_CLI_VERSION || '1.3.5'
+  return buildAgyCliUserAgent(version)
 }
 
 export function antigravityHeaders(token: string): Record<string, string> {

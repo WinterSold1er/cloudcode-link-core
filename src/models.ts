@@ -5,21 +5,10 @@
 // (agy rejects --effort for Claude/GPT-OSS). Discovery failure falls back to
 // a bundled catalog so the /model picker is never empty.
 import { DEFAULT_FALLBACK_MODELS, type FallbackModelDef, type ModelModality, type PluginConfig } from './types/config-types.ts'
+import type { DiscoveredModelEntry, DiscoveredModelsResponse } from './types/pool-types.ts'
+export type { DiscoveredModelEntry, DiscoveredModelsResponse }
 
 export interface RawModel { slug: string; label: string }
-
-export interface DiscoveredModelEntry {
-  quotaInfo?: {
-    remainingFraction?: number
-    resetTime?: string
-  }
-  displayName?: string
-  modelName?: string
-}
-
-export interface DiscoveredModelsResponse {
-  models?: Record<string, DiscoveredModelEntry>
-}
 
 export interface CatalogEntry {
   id: string
@@ -36,6 +25,10 @@ export interface Catalog {
   discoveredAt: number
   /** Last discovery error, surfaced by /agy models and doctor. */
   lastError?: string
+  /** Account-level discovery failures for observability. */
+  accountFailures?: ReadonlyArray<{ accountId: string; error: string }>
+  /** Endpoint-level discovery errors for observability. */
+  endpointErrors?: readonly string[]
 }
 
 export function prettifyModelSlug(slug: string): string {
@@ -55,7 +48,14 @@ export function prettifyModelSlug(slug: string): string {
 
 export function isInternalModel(slug: string): boolean {
   const s = slug.trim().toLowerCase()
-  return /^chat_\d+$/i.test(s) || /^tab[_-]/i.test(s) || /_preview$/i.test(s) || /-preview$/i.test(s)
+  return (
+    /^chat_\d+$/i.test(s) ||
+    /^tab[_-]/i.test(s) ||
+    /_preview$/i.test(s) ||
+    /-preview$/i.test(s) ||
+    /-(?:disabled|sonar)(?:-|$)/i.test(s) ||
+    /-tiered-/i.test(s)
+  )
 }
 
 /** Parse `agy models` stdout: JSON shapes first, then two-column text. */
@@ -107,20 +107,94 @@ function extractModelList(parsed: unknown): RawModel[] | null {
   if (Array.isArray(parsed)) arr = parsed;
   else if (parsed && typeof parsed === 'object') {
     const o = parsed as Record<string, unknown>
-    if (o.models && typeof o.models === 'object' && !Array.isArray(o.models)) {
+    const modelsMap = (o.models && typeof o.models === 'object' && !Array.isArray(o.models))
+      ? (o.models as Record<string, Record<string, unknown>>)
+      : null
+
+    // 1. Authoritative order from agentModelSorts (exact parity with agy models)
+    if (Array.isArray(o.agentModelSorts) && o.agentModelSorts.length > 0) {
+      const sortedIds: string[] = []
+      for (const sortItem of o.agentModelSorts as Array<Record<string, unknown>>) {
+        if (Array.isArray(sortItem.groups)) {
+          for (const group of sortItem.groups as Array<Record<string, unknown>>) {
+            if (Array.isArray(group.modelIds)) {
+              for (const mid of group.modelIds) {
+                if (typeof mid === 'string' && mid.trim() !== '') sortedIds.push(mid.trim())
+              }
+            }
+          }
+        } else if (Array.isArray(sortItem.modelIds)) {
+          for (const mid of sortItem.modelIds) {
+            if (typeof mid === 'string' && mid.trim() !== '') sortedIds.push(mid.trim())
+          }
+        }
+      }
+
+      if (sortedIds.length > 0) {
+        const out: RawModel[] = []
+        const seen = new Set<string>()
+        for (const mid of sortedIds) {
+          if (seen.has(mid)) continue
+          seen.add(mid)
+          if (isInternalModel(mid)) continue
+          const entry = modelsMap?.[mid]
+          if (entry && (entry.disabled === true || entry.enabled === false)) continue
+
+          const rawLabel =
+            (typeof entry?.displayName === 'string' && entry.displayName.trim() !== '') ? entry.displayName.trim()
+            : (typeof entry?.display_name === 'string' && entry.display_name.trim() !== '') ? entry.display_name.trim()
+            : (typeof entry?.modelName === 'string' && entry.modelName.trim() !== '') ? entry.modelName.trim()
+            : (typeof entry?.name === 'string' && entry.name.trim() !== '') ? entry.name.trim()
+            : ''
+          const label = rawLabel !== '' && rawLabel !== mid ? rawLabel : prettifyModelSlug(mid)
+          out.push({ slug: mid, label })
+        }
+        if (out.length > 0) return out
+      }
+    }
+
+    // 2. Fallback: traverse models dict if present
+    if (modelsMap) {
       const out: RawModel[] = []
-      for (const [key, val] of Object.entries(o.models as Record<string, unknown>)) {
+      const labelOwners = new Map<string, string>()
+      const duplicateLabels = new Set<string>()
+
+      for (const [key, val] of Object.entries(modelsMap)) {
         if (!key || typeof key !== 'string') continue
         const trimmedKey = key.trim()
         if (isInternalModel(trimmedKey)) continue
         const v = (val && typeof val === 'object' ? val : {}) as Record<string, unknown>
+        if (v.disabled === true || v.enabled === false) continue
         const rawLabel =
           (typeof v.displayName === 'string' && v.displayName.trim() !== '') ? v.displayName.trim()
           : (typeof v.display_name === 'string' && v.display_name.trim() !== '') ? v.display_name.trim()
           : (typeof v.modelName === 'string' && v.modelName.trim() !== '') ? v.modelName.trim()
           : (typeof v.name === 'string' && v.name.trim() !== '') ? v.name.trim()
           : ''
-        const label = rawLabel !== '' && rawLabel !== trimmedKey ? rawLabel : prettifyModelSlug(trimmedKey)
+        if (rawLabel !== '') {
+          if (labelOwners.has(rawLabel)) {
+            duplicateLabels.add(rawLabel)
+          } else {
+            labelOwners.set(rawLabel, trimmedKey)
+          }
+        }
+      }
+
+      for (const [key, val] of Object.entries(modelsMap)) {
+        if (!key || typeof key !== 'string') continue
+        const trimmedKey = key.trim()
+        if (isInternalModel(trimmedKey)) continue
+        const v = (val && typeof val === 'object' ? val : {}) as Record<string, unknown>
+        if (v.disabled === true || v.enabled === false) continue
+        const rawLabel =
+          (typeof v.displayName === 'string' && v.displayName.trim() !== '') ? v.displayName.trim()
+          : (typeof v.display_name === 'string' && v.display_name.trim() !== '') ? v.display_name.trim()
+          : (typeof v.modelName === 'string' && v.modelName.trim() !== '') ? v.modelName.trim()
+          : (typeof v.name === 'string' && v.name.trim() !== '') ? v.name.trim()
+          : ''
+        const label = (rawLabel !== '' && rawLabel !== trimmedKey && !duplicateLabels.has(rawLabel))
+          ? rawLabel
+          : prettifyModelSlug(trimmedKey)
         out.push({ slug: trimmedKey, label })
       }
       return out
@@ -147,6 +221,7 @@ function extractModelList(parsed: unknown): RawModel[] | null {
     if (typeof slugV !== 'string' || slugV.trim() === '') continue
     const trimmedSlug = slugV.trim()
     if (isInternalModel(trimmedSlug)) continue
+    if (o.disabled === true || o.enabled === false) continue
     const rawLabel = o.label ?? o.display_name ?? o.displayName ?? o.title;
     const labelStr = (typeof rawLabel === 'string' && rawLabel.trim() !== '' && rawLabel.trim() !== trimmedSlug)
       ? rawLabel.trim()
@@ -156,7 +231,7 @@ function extractModelList(parsed: unknown): RawModel[] | null {
   return out;
 }
 
-const EFFORT_SUFFIXES = ['low', 'medium', 'high']
+const EFFORT_SUFFIXES = ['low', 'medium', 'high', 'xhigh']
 
 export function getInputModalitiesForModel(modelId: string): readonly ModelModality[] {
   const wire = resolveModelSlug(modelId).toLowerCase()
@@ -171,6 +246,9 @@ export function deriveEffortsForModel(modelId: string): string[] | null {
   if (id === 'gemini-3.1-pro' || id.startsWith('gemini-3.1-pro')) {
     return ['low', 'high']
   }
+  if (id === 'gemini-4-hydrogen' || id.startsWith('gemini-4-hydrogen')) {
+    return ['low', 'medium', 'high', 'xhigh']
+  }
   if (/^gemini-(?:[3-9]|\d{2,})(?:[.-]|$)/i.test(id)) {
     return ['low', 'medium', 'high']
   }
@@ -179,6 +257,10 @@ export function deriveEffortsForModel(modelId: string): string[] | null {
 
 function stripTieredLabel(label: string): string {
   return label.replace(/\s*\((?:Tiered|tiered)\)\s*$/i, '').replace(/\s+(?:Tiered|tiered)\s*$/i, '').trim()
+}
+
+function isValidGeminiBase(base: string): boolean {
+  return !base.includes('-tiered') && !base.includes('-sonar') && !base.includes('-disabled')
 }
 
 /** Fold Gemini effort variants into base + effort set (spec ADR-10). */
@@ -197,6 +279,7 @@ export function foldEfforts(raw: readonly RawModel[]): CatalogEntry[] {
 
     if (r.slug.endsWith('-tiered')) {
       const base = r.slug.slice(0, -7)
+      if (!isValidGeminiBase(base)) continue
       const inferredEfforts = deriveEffortsForModel(base)
       const cleanLabel = stripTieredLabel(r.label)
       const displayLabel = (cleanLabel !== '' && cleanLabel !== base && cleanLabel !== r.slug)
@@ -226,7 +309,7 @@ export function foldEfforts(raw: readonly RawModel[]): CatalogEntry[] {
         const hasSibling = raw.some(
           (x) => x.slug.startsWith(base + '-') && EFFORT_SUFFIXES.some((e) => x.slug.endsWith('-' + e)) && x.slug !== r.slug,
         );
-        if (hasBare || hasSibling) {
+        if ((hasBare || hasSibling) && isValidGeminiBase(base)) {
           const stripped = stripEffortLabel(r.label, eff)
           const displayLabel = (stripped !== '' && stripped !== base && stripped !== r.slug)
             ? stripped
@@ -240,6 +323,7 @@ export function foldEfforts(raw: readonly RawModel[]): CatalogEntry[] {
       }
     }
     if (!folded) {
+      if (!isValidGeminiBase(r.slug)) continue
       const displayLabel = (r.label && r.label.trim() !== '' && r.label.trim() !== r.slug)
         ? r.label.trim()
         : prettifyModelSlug(r.slug)
@@ -300,6 +384,14 @@ export type DiscoverResult =
 
 export type DiscoverFn = (signal?: AbortSignal) => Promise<DiscoverResult>
 
+/**
+ * Union a discovered catalog with the built-in fallback table.
+ *
+ * Kept for callers that explicitly want the union (and as the documented shape of
+ * the historical behaviour). `ModelCatalog.refresh()` no longer calls it on the
+ * success path: a successful discovery is reported as-is, so ids upstream does not
+ * serve can never leak into a `source: 'discovered'` catalog.
+ */
 export function mergeDiscoveredWithFallback(
   discovered: readonly CatalogEntry[],
   fallbackDefs: readonly FallbackModelDef[] = DEFAULT_FALLBACK_MODELS,
@@ -396,10 +488,29 @@ export class ModelCatalog {
           if (list) raw = dedupeBySlug(list);
         }
 
+        const accountFailures =
+          typeof res === 'object' && res && 'accountFailures' in res && Array.isArray((res as DiscoveredModelsResponse).accountFailures)
+            ? (res as DiscoveredModelsResponse).accountFailures
+            : undefined
+
+        const endpointErrors =
+          typeof res === 'object' && res && 'endpointErrors' in res && Array.isArray((res as DiscoveredModelsResponse).endpointErrors)
+            ? (res as DiscoveredModelsResponse).endpointErrors
+            : undefined
+
         if (raw.length > 0) {
           const folded = foldEfforts(raw);
-          const merged = mergeDiscoveredWithFallback(folded, this.fallbackDefs);
-          this.current = { source: 'discovered', models: merged, discoveredAt: Date.now() };
+          // A successful discovery is authoritative: the catalog holds exactly the
+          // models upstream serves (after the folding rules), never a union with the
+          // built-in table. `fallbackDefs` stay the initial catalog (constructor) and
+          // the keep-previous-catalog path used when discovery fails.
+          this.current = {
+            source: 'discovered',
+            models: folded,
+            discoveredAt: Date.now(),
+            ...(accountFailures && accountFailures.length > 0 ? { accountFailures } : {}),
+            ...(endpointErrors && endpointErrors.length > 0 ? { endpointErrors } : {}),
+          };
           return;
         }
         if (this.current.source === 'fallback') {
@@ -632,13 +743,13 @@ export function getAntigravityRequestModelId(modelId: string, effort?: string): 
       resolvedId.endsWith('-low') ||
       resolvedId.endsWith('-medium') ||
       resolvedId.endsWith('-high') ||
+      resolvedId.endsWith('-xhigh') ||
       resolvedId.endsWith('-tiered') ||
       resolvedId.endsWith('-extra-low') ||
       resolvedId.endsWith('-thinking')
     if (/^gemini-(?:[3-9]|\d{2,})(?:[.-]|$)/i.test(resolvedId) && !isWireModel) {
       if (effort && effort !== 'off' && ['low', 'medium', 'high', 'xhigh'].includes(effort.toLowerCase())) {
-        const eff = effort.toLowerCase() === 'xhigh' ? 'high' : effort.toLowerCase()
-        return `${resolvedId}-${eff}`
+        return `${resolvedId}-${effort.toLowerCase()}`
       }
       return `${resolvedId}-low`
     }

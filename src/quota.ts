@@ -7,6 +7,8 @@ import { dirname, join } from 'node:path'
 import {
   modelFamilyOf,
   shouldPollAccount,
+  type DiscoveredModelEntry,
+  type DiscoveredModelsResponse,
   type FamilyQuotaInfo,
   type ManagedAccount,
   type ModelFamily,
@@ -59,10 +61,26 @@ export function detectEmailFromAgyLogs(homeDir: string): string | undefined {
 }
 
 
-export function agyUserAgent(version = '1.1.15'): string {
-  const os = process.platform === 'win32' ? 'windows' : process.platform
-  const arch = process.arch === 'x64' ? 'amd64' : process.arch
-  return `antigravity/${version} ${os}/${arch}`
+export function resolveClientPlatform(): { osType: string; arch: string } {
+  const osType = process.platform === 'win32' ? 'windows' : process.platform === 'darwin' ? 'darwin' : 'linux'
+  const arch = process.arch === 'x64' ? 'amd64' : process.arch === 'arm64' ? 'arm64' : process.arch
+  return { osType, arch }
+}
+
+export function buildAgyCliUserAgent(version = '1.3.5'): string {
+  const { osType, arch } = resolveClientPlatform()
+  return `antigravity/cli/${version} (aidev_client; os_type=${osType}; arch=${arch}; cl=998863838; auth_method=consumer)`
+}
+
+export const AGY_DISCOVERY_USER_AGENT = buildAgyCliUserAgent('1.3.5')
+export const AGY_QUOTA_USER_AGENT = 'antigravity/1.1.15 linux/amd64'
+
+export function agyUserAgent(version = '1.3.5'): string {
+  return buildAgyCliUserAgent(version)
+}
+
+export function agyQuotaUserAgent(): string {
+  return AGY_QUOTA_USER_AGENT
 }
 
 export interface StoredToken {
@@ -109,17 +127,113 @@ export function normalizeStoredToken(raw: Record<string, unknown>): StoredToken 
   return { accessToken: accessToken ?? '', refreshToken, expiryMs }
 }
 
-interface DiscoveredModelEntry {
-  quotaInfo?: {
-    remainingFraction?: number
-    resetTime?: string
+function mergeAgentModelSorts(
+  target: DiscoveredModelsResponse['agentModelSorts'] | undefined,
+  incoming: DiscoveredModelsResponse['agentModelSorts'] | undefined,
+): DiscoveredModelsResponse['agentModelSorts'] | undefined {
+  if (!incoming || !Array.isArray(incoming) || incoming.length === 0) return target
+  if (!target || !Array.isArray(target) || target.length === 0) {
+    return incoming.map((s) => ({
+      ...s,
+      groups: s.groups?.map((g) => ({ ...g, modelIds: g.modelIds ? [...g.modelIds] : undefined })),
+      modelIds: s.modelIds ? [...s.modelIds] : undefined,
+    }))
   }
-  displayName?: string
-  modelName?: string
+
+  for (const incSort of incoming) {
+    const matchedSort = target.find((t) => t.displayName === incSort.displayName)
+    if (!matchedSort) {
+      target.push({
+        ...incSort,
+        groups: incSort.groups?.map((g) => ({ ...g, modelIds: g.modelIds ? [...g.modelIds] : undefined })),
+        modelIds: incSort.modelIds ? [...incSort.modelIds] : undefined,
+      })
+      continue
+    }
+
+    if (Array.isArray(incSort.groups)) {
+      matchedSort.groups = matchedSort.groups || []
+      for (const incGroup of incSort.groups) {
+        const matchedGroup = matchedSort.groups.find((g) => g.displayName === incGroup.displayName)
+        if (!matchedGroup) {
+          matchedSort.groups.push({
+            ...incGroup,
+            modelIds: incGroup.modelIds ? [...incGroup.modelIds] : undefined,
+          })
+          continue
+        }
+        if (Array.isArray(incGroup.modelIds)) {
+          const incIds = incGroup.modelIds
+          const curIds = matchedGroup.modelIds || []
+          if (incIds.length > curIds.length) {
+            const seen = new Set(incIds)
+            const mergedIds = [...incIds]
+            for (const mid of curIds) {
+              if (!seen.has(mid)) {
+                seen.add(mid)
+                mergedIds.push(mid)
+              }
+            }
+            matchedGroup.modelIds = mergedIds
+          } else {
+            const seen = new Set(curIds)
+            matchedGroup.modelIds = [...curIds]
+            for (const mid of incIds) {
+              if (!seen.has(mid)) {
+                seen.add(mid)
+                matchedGroup.modelIds.push(mid)
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if (Array.isArray(incSort.modelIds)) {
+      const incIds = incSort.modelIds
+      const curIds = matchedSort.modelIds || []
+      if (incIds.length > curIds.length) {
+        const seen = new Set(incIds)
+        const mergedIds = [...incIds]
+        for (const mid of curIds) {
+          if (!seen.has(mid)) {
+            seen.add(mid)
+            mergedIds.push(mid)
+          }
+        }
+        matchedSort.modelIds = mergedIds
+      } else {
+        const seen = new Set(curIds)
+        matchedSort.modelIds = [...curIds]
+        for (const mid of incIds) {
+          if (!seen.has(mid)) {
+            seen.add(mid)
+            matchedSort.modelIds.push(mid)
+          }
+        }
+      }
+    }
+  }
+
+  return target
 }
 
-interface DiscoveredModelsResponse {
-  models?: Record<string, DiscoveredModelEntry>
+// Cross-account model discovery budgets. Upstream single-account single-endpoint
+// fetches measure 6.5-9.2s, and ModelCatalog aborts a refresh after 30s, so the
+// whole merge must stay well inside that ceiling.
+const DISCOVER_MAX_CONCURRENCY = 4
+const DISCOVER_ACCOUNT_TIMEOUT_MS = 8_000
+const DISCOVER_TOTAL_BUDGET_MS = 20_000
+
+/** Resolve to `value` or `null` once `ms` elapses; the underlying promise keeps running. */
+function raceTimeout<T>(value: Promise<T>, ms: number): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), ms)
+  })
+  return Promise.race([value, timeout]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer)
+  })
 }
 
 interface QuotaSummaryBucket {
@@ -167,6 +281,16 @@ export class QuotaService {
   private preferredEndpointIndex = 0
   private readonly pool: AccountPoolManager
   private readonly refreshLocks = new Map<string, Promise<string | null>>()
+  public lastEndpointErrors: string[] = []
+  public lastQuotaEndpointErrors: string[] = []
+  public lastDiscoveryDiagnostics?: {
+    at: number
+    succeeded: number
+    failures: number
+    skippedOverBudget: number
+    accountFailures: Array<{ accountId: string; error: string }>
+    endpointErrors?: string[]
+  }
 
   constructor(pool: AccountPoolManager) {
     this.pool = pool
@@ -327,6 +451,7 @@ export class QuotaService {
 
   async fetchQuotaSummary(accessToken: string, proxyUrl?: string): Promise<QuotaSummaryResponse | null> {
     const endpoints = this.getOrderedEndpoints()
+    const endpointErrors: string[] = []
     for (let i = 0; i < endpoints.length; i++) {
       const endpoint = endpoints[i]!
       try {
@@ -335,26 +460,30 @@ export class QuotaService {
           headers: {
             Authorization: `Bearer ${accessToken}`,
             'Content-Type': 'application/json',
-            'User-Agent': agyUserAgent(),
+            'User-Agent': agyQuotaUserAgent(),
           },
           body: JSON.stringify({}),
         }, proxyUrl)
         if (res.ok) {
           this.preferredEndpointIndex = AGY_ENDPOINTS.indexOf(endpoint)
+          this.lastQuotaEndpointErrors = endpointErrors
           return (await res.json()) as QuotaSummaryResponse
         }
+        endpointErrors.push(`${endpoint} returned ${res.status}`)
         if (res.status === 401 || res.status === 403) {
-          break
+          continue
         }
-      } catch {
-        // Try next endpoint
+      } catch (err) {
+        endpointErrors.push(`${endpoint} error: ${err instanceof Error ? err.message : String(err)}`)
       }
     }
+    this.lastQuotaEndpointErrors = endpointErrors
     return null
   }
 
   async fetchAvailableModels(accessToken: string, proxyUrl?: string): Promise<DiscoveredModelsResponse | null> {
     const endpoints = this.getOrderedEndpoints()
+    const endpointErrors: string[] = []
     for (let i = 0; i < endpoints.length; i++) {
       const endpoint = endpoints[i]!
       try {
@@ -369,32 +498,152 @@ export class QuotaService {
         }, proxyUrl)
         if (res.ok) {
           this.preferredEndpointIndex = AGY_ENDPOINTS.indexOf(endpoint)
+          this.lastEndpointErrors = endpointErrors
           return (await res.json()) as DiscoveredModelsResponse
         }
+        endpointErrors.push(`${endpoint} returned ${res.status}`)
         if (res.status === 401 || res.status === 403) {
-          break
+          continue
         }
-      } catch {
-        // Try next endpoint
+      } catch (err) {
+        endpointErrors.push(`${endpoint} error: ${err instanceof Error ? err.message : String(err)}`)
       }
     }
+    this.lastEndpointErrors = endpointErrors
     return null
   }
 
-  async discoverAvailableModels(): Promise<DiscoveredModelsResponse | null> {
+  /**
+   * Discover the models this installation can actually serve.
+   *
+   * Upstream answers per account: an id can be missing from the primary account's
+   * `fetchAvailableModels` payload yet present in a pooled secondary account. So the
+   * whole usable pool is fetched and the `models` maps are unioned by model id —
+   * same id in several accounts keeps the entry that carries `quotaInfo`, otherwise
+   * the first one seen (primary account first). A single failing account never fails
+   * the discovery; only an all-failed pool returns null (which makes ModelCatalog
+   * keep its previous catalog and record `lastError`).
+   *
+   * Budget: at most `concurrency` accounts in flight, `accountTimeoutMs` per account,
+   * and `totalBudgetMs` overall — accounts started after the budget is exhausted are
+   * skipped rather than delaying the merge.
+   */
+  async discoverAvailableModels(options?: {
+    concurrency?: number
+    accountTimeoutMs?: number
+    totalBudgetMs?: number
+  }): Promise<DiscoveredModelsResponse | null> {
     if (process.env.ANTIGRAVITY_TOKEN?.trim()) {
       return this.fetchAvailableModels(process.env.ANTIGRAVITY_TOKEN.trim())
     }
+
     const poolData = this.pool.getPoolData()
     const primaryAcc = poolData.primaryAccountId ? this.pool.getAccount(poolData.primaryAccountId) : undefined
-    const candidate = (primaryAcc && primaryAcc.enabled && !primaryAcc.authRequired)
-      ? primaryAcc
-      : this.pool.getAccounts().find((a) => a.enabled && !a.authRequired)
+    const usable = this.pool.getAccounts().filter((a) => a.enabled && !a.authRequired)
+    if (usable.length === 0) return null
 
-    if (!candidate) return null
-    const accessToken = await this.getValidAccessToken(candidate)
-    if (!accessToken) return null
-    return this.fetchAvailableModels(accessToken, candidate.proxyUrl)
+    // Primary first: its entries win id collisions, and if the budget runs out the
+    // primary account's models are the ones already merged.
+    const ordered: ManagedAccount[] = []
+    if (primaryAcc && primaryAcc.enabled && !primaryAcc.authRequired) ordered.push(primaryAcc)
+    for (const acc of usable) {
+      if (!ordered.some((a) => a.id === acc.id)) ordered.push(acc)
+    }
+
+    const concurrency = Math.max(1, Math.min(options?.concurrency ?? DISCOVER_MAX_CONCURRENCY, ordered.length))
+    const accountTimeoutMs = options?.accountTimeoutMs ?? DISCOVER_ACCOUNT_TIMEOUT_MS
+    const deadline = Date.now() + (options?.totalBudgetMs ?? DISCOVER_TOTAL_BUDGET_MS)
+
+    const merged = new Map<string, DiscoveredModelEntry>()
+    const accountSorts = new Map<string, DiscoveredModelsResponse['agentModelSorts']>()
+    let succeeded = 0
+    let failures = 0
+    let skippedOverBudget = 0
+    const failureDetails: Array<{ accountId: string; error: string }> = []
+
+    let cursor = 0
+    const fetchOne = async (acc: ManagedAccount): Promise<{ res: DiscoveredModelsResponse | null; error?: string }> => {
+      const accessToken = await this.getValidAccessToken(acc)
+      if (!accessToken) return { res: null, error: 'Failed to acquire valid access token' }
+      try {
+        const res = await this.fetchAvailableModels(accessToken, acc.proxyUrl)
+        if (!res) return { res: null, error: 'fetchAvailableModels returned null from all endpoints' }
+        return { res }
+      } catch (err) {
+        return { res: null, error: err instanceof Error ? err.message : String(err) }
+      }
+    }
+
+    const workers = Array.from({ length: concurrency }, async () => {
+      for (;;) {
+        const acc = ordered[cursor++]
+        if (acc === undefined) return
+        const remaining = deadline - Date.now()
+        if (remaining <= 0) {
+          skippedOverBudget++
+          failureDetails.push({ accountId: acc.id, error: 'Skipped over budget' })
+          continue
+        }
+        try {
+          const outcome = await raceTimeout(fetchOne(acc), Math.min(accountTimeoutMs, remaining))
+          if (!outcome?.res) {
+            failures++
+            failureDetails.push({ accountId: acc.id, error: outcome?.error ?? 'Timeout or empty response' })
+            continue
+          }
+          const res = outcome.res
+          succeeded++
+          if (Array.isArray(res.agentModelSorts) && res.agentModelSorts.length > 0) {
+            accountSorts.set(acc.id, res.agentModelSorts)
+          }
+          for (const [modelId, entry] of Object.entries(res.models ?? {})) {
+            const prev = merged.get(modelId)
+            if (!prev) {
+              merged.set(modelId, entry ?? {})
+              continue
+            }
+            const prevHasQuota = prev.quotaInfo !== undefined
+            const nextHasQuota = entry?.quotaInfo !== undefined
+            if (!prevHasQuota && nextHasQuota) merged.set(modelId, entry)
+          }
+        } catch (err) {
+          // One account must never sink the discovery: keep what the others returned.
+          failures++
+          failureDetails.push({ accountId: acc.id, error: err instanceof Error ? err.message : String(err) })
+        }
+      }
+    })
+    await Promise.allSettled(workers)
+
+    if (succeeded === 0 || merged.size === 0) return null
+
+    // Deterministically merge agentModelSorts in fixed ordered account sequence (primary first)
+    let primarySorts: DiscoveredModelsResponse['agentModelSorts'] = undefined
+    for (const acc of ordered) {
+      const sorts = accountSorts.get(acc.id)
+      if (sorts) {
+        primarySorts = mergeAgentModelSorts(primarySorts, sorts)
+      }
+    }
+
+    this.lastDiscoveryDiagnostics = {
+      at: Date.now(),
+      succeeded,
+      failures,
+      skippedOverBudget,
+      accountFailures: failureDetails,
+      endpointErrors: this.lastEndpointErrors,
+    }
+
+    return {
+      models: Object.fromEntries(merged),
+      ...(primarySorts ? { agentModelSorts: primarySorts } : {}),
+      discoveredFromAccounts: succeeded,
+      discoveredAccountFailures: failures,
+      discoveredSkippedOverBudget: skippedOverBudget,
+      accountFailures: failureDetails,
+      endpointErrors: this.lastEndpointErrors,
+    }
   }
 
   async refreshAccountQuota(
@@ -503,12 +752,13 @@ export class QuotaService {
 
         for (const fam of targetFamilies) {
           summaryFamilies.add(fam)
+          const prev = familyQuotas[fam]
           familyQuotas[fam] = {
-            remainingFraction: fiveHourFrac,
-            resetTime: fiveHourReset,
-            weeklyFraction: weeklyFrac,
-            weeklyResetTime: weeklyReset,
-            description: group.description,
+            remainingFraction: fiveHourFrac !== undefined ? fiveHourFrac : prev?.remainingFraction,
+            resetTime: fiveHourReset !== undefined ? fiveHourReset : prev?.resetTime,
+            weeklyFraction: weeklyFrac !== undefined ? weeklyFrac : prev?.weeklyFraction,
+            weeklyResetTime: weeklyReset !== undefined ? weeklyReset : prev?.weeklyResetTime,
+            description: group.description || prev?.description,
             updatedAt: now,
           }
         }

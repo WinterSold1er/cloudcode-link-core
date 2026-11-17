@@ -141,3 +141,34 @@ export function defaultPoolData(): AccountPoolData {
     accounts: [],
   }
 }
+
+export interface DiscoveredModelEntry {
+  quotaInfo?: {
+    remainingFraction?: number
+    resetTime?: string
+  }
+  displayName?: string
+  modelName?: string
+  disabled?: boolean
+  enabled?: boolean
+}
+
+export interface DiscoveredModelsResponse {
+  models?: Record<string, DiscoveredModelEntry>
+  agentModelSorts?: Array<{
+    displayName?: string
+    groups?: Array<{
+      displayName?: string
+      modelIds?: string[]
+    }>
+    modelIds?: string[]
+  }>
+  defaultAgentModelId?: string
+  /** Cross-account discovery bookkeeping (set by discoverAvailableModels only). */
+  discoveredFromAccounts?: number
+  discoveredAccountFailures?: number
+  discoveredSkippedOverBudget?: number
+  accountFailures?: Array<{ accountId: string; error: string }>
+  endpointErrors?: string[]
+}
+

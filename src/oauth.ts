@@ -40,8 +40,8 @@ export function oauthRedirectUri(port: number = OAUTH_CALLBACK_PORT): string {
 export const OAUTH_REDIRECT_URI = oauthRedirectUri()
 
 export const AGY_ENDPOINTS: readonly string[] = [
-  'https://cloudcode-pa.googleapis.com',
   'https://daily-cloudcode-pa.googleapis.com',
+  'https://cloudcode-pa.googleapis.com',
   'https://daily-cloudcode-pa.sandbox.googleapis.com',
   'https://autopush-cloudcode-pa.sandbox.googleapis.com',
 ]
