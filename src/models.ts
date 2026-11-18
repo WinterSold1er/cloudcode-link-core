@@ -580,13 +580,172 @@ export function defaultEffortFor(entry: CatalogEntry, cfg: { defaultEffort?: str
   return entry.efforts[entry.efforts.length - 1];
 }
 
-export const ANTIGRAVITY_MODEL_ENUM: Record<string, string> = {
-  'gemini-3.5-flash-extra-low': 'MODEL_PLACEHOLDER_M187',
-  'gemini-3.5-flash-low': 'MODEL_PLACEHOLDER_M20',
-  'gemini-3-flash-agent': 'MODEL_PLACEHOLDER_M132',
-  'gemini-3.1-pro-low': 'MODEL_PLACEHOLDER_M36',
-  'gemini-pro-agent': 'MODEL_PLACEHOLDER_M16',
+/**
+ * agy (Antigravity CLI) 1.3.5 wire model id -> `exa.codeium_common_pb.Model` enum name,
+ * i.e. the value agy puts in `request.labels.model_enum`. Single source of truth;
+ * `ANTIGRAVITY_MODEL_ENUM` below is derived from it.
+ *
+ * Evidence (every row is a measured pair — no `1000 + n` back-computation here):
+ *  - agy 1.3.5 binary descriptor: the enum is `exa.codeium_common_pb.Model`, and
+ *    `MODEL_PLACEHOLDER_M{n}` carries the value `1000 + n` (1651 placeholder members).
+ *    The numbering rule is only used to *read* pairs found elsewhere, never to invent one.
+ *  - Per-variant values come from `test/fixtures/fetch-available-models.json`, a real
+ *    `FetchAvailableModelsResponse` capture: the map key is the wire model id and
+ *    `ModelDetails.model` (field 15) is the enum the server issues for that exact variant
+ *    (gemini-4-hydrogen-high -> M525, -medium -> M526, -low -> M527, -xhigh -> M528,
+ *    -tiered-high -> M530, -tiered-xhigh -> M531, -sonar -> M578; gemini-4-argon-high -> M417,
+ *    -medium -> M418, -low -> M419; gemini-4-carbon-disabled -> M670; gemini-3.5-flash-lite -> M198).
+ *  - Family rows (bare ids) come from agy's own `conversations/*.db`, where `model_enum` and the
+ *    wire model string appear together: `gemini-4-hydrogen` -> M526,
+ *    `gemini-4-argon-medium` / `gemini-4-argon-trial` -> M418. They also serve as the fallback
+ *    for a variant the capture does not list.
+ *  - Captured upstream request (ops/relink/t2-traffic-findings.md:57/65/121): body
+ *    `model: "gemini-4-hydrogen-medium"` with `labels.model_enum = MODEL_PLACEHOLDER_M526`,
+ *    which is exactly the `-medium` variant row below — the reason exact variants win.
+ *  - The three rows the capture does not carry (`gemini-4-hydrogen`, `gemini-4-argon`,
+ *    `gemini-4-argon-trial`) are the pairs written down in ops/relink/t2-model-enum-evidence.md:
+ *    read out of agy's own `gen_metadata` blobs (`gemini-4-argon-trial` -> M418 observed; the two
+ *    family values derived from the captured `-medium` variant, which the live request pairs with
+ *    the same enum). The capture neither lists nor contradicts them.
+ *
+ * A row exists for every entry the capture serves, and for nothing else: ids with no measured
+ * pair (`claude-opus-4-6-thinking`, `claude-opus-4-8`, `claude-sonnet-4-6`, `claude-haiku-4-5`,
+ * `gemini-3.6-flash-*`, `gemini-3.7-flash-*`, the bare `gemini-3.5-flash` / `gemini-3.8-flash` /
+ * `gemini-4-carbon` families, and the five ids whose pairing reviewer2 could not source —
+ * `gemini-3.5-flash-extra-low`, `gemini-3.5-flash-low`, `gemini-3-flash-agent`,
+ * `gemini-3.1-pro-low`, `gemini-pro-agent`, all five deleted from this table on 2026-11-18)
+ * resolve to `undefined` rather than a guess. That bidirectional lock is asserted by
+ * test/agy-models-alignment.test.ts.
+ *
+ * Lookup order: the exact wire id wins, and only a variant the capture does not list falls back
+ * to its family row (e.g. `gemini-4-hydrogen-tiered-low` -> M526). Internal variants keep their
+ * measured enum here but never reach the catalog (see isInternalModel), so they stay unselectable.
+ */
+export const AGY_MODEL_ENUM_BY_WIRE_ID: Readonly<Record<string, string>> = {
+  // gemini-4-hydrogen: family row + every variant the captured response issues.
+  'gemini-4-hydrogen': 'MODEL_PLACEHOLDER_M526',
+  'gemini-4-hydrogen-high': 'MODEL_PLACEHOLDER_M525',
+  'gemini-4-hydrogen-medium': 'MODEL_PLACEHOLDER_M526',
+  'gemini-4-hydrogen-low': 'MODEL_PLACEHOLDER_M527',
+  'gemini-4-hydrogen-xhigh': 'MODEL_PLACEHOLDER_M528',
+  'gemini-4-hydrogen-tiered-high': 'MODEL_PLACEHOLDER_M530',
+  'gemini-4-hydrogen-tiered-xhigh': 'MODEL_PLACEHOLDER_M531',
+  'gemini-4-hydrogen-sonar': 'MODEL_PLACEHOLDER_M578',
+  // gemini-4-argon: same shape. -trial is its own wire id, not an effort variant.
+  'gemini-4-argon': 'MODEL_PLACEHOLDER_M418',
+  'gemini-4-argon-high': 'MODEL_PLACEHOLDER_M417',
+  'gemini-4-argon-medium': 'MODEL_PLACEHOLDER_M418',
+  'gemini-4-argon-low': 'MODEL_PLACEHOLDER_M419',
+  'gemini-4-argon-trial': 'MODEL_PLACEHOLDER_M418',
+  // gemini-4-carbon is only ever served disabled; no family row is claimed for it.
+  'gemini-4-carbon-disabled': 'MODEL_PLACEHOLDER_M670',
+  // gemini-3.8-flash: every variant the captured response issues (no bare family row is claimed).
+  'gemini-3.8-flash-high': 'MODEL_PLACEHOLDER_M318',
+  'gemini-3.8-flash-medium': 'MODEL_PLACEHOLDER_M319',
+  'gemini-3.8-flash-low': 'MODEL_PLACEHOLDER_M320',
+  'gemini-3.8-flash-tiered': 'MODEL_PLACEHOLDER_M322',
+  // Older gemini generations, one row per wire id the capture serves.
+  'gemini-3.5-flash-lite': 'MODEL_PLACEHOLDER_M198',
+  'gemini-3.1-flash-image': 'MODEL_PLACEHOLDER_M21',
+  'gemini-3.1-flash-lite': 'MODEL_PLACEHOLDER_M50',
+  'gemini-3-flash': 'MODEL_PLACEHOLDER_M18',
+  'gemini-2.5-flash': 'MODEL_GOOGLE_GEMINI_2_5_FLASH',
+  'gemini-2.5-flash-lite': 'MODEL_GOOGLE_GEMINI_2_5_FLASH_LITE',
+  'gemini-2.5-flash-thinking': 'MODEL_GOOGLE_GEMINI_2_5_FLASH_THINKING',
+  'gemini-2.5-pro': 'MODEL_GOOGLE_GEMINI_2_5_PRO',
+  // Claude 5.5 family as the capture names it. claude-opus-4-6 / -4-8 / sonnet-4-6 / haiku-4-5
+  // have no measured enum anywhere yet, so they deliberately have no row (lookupModelEnum
+  // returns undefined for them instead of guessing).
+  'claude-opus-5-5-high': 'MODEL_PLACEHOLDER_M402',
+  'claude-opus-5-5-medium': 'MODEL_PLACEHOLDER_M401',
+  'claude-opus-5-5-low': 'MODEL_PLACEHOLDER_M400',
+  'claude-sonnet-5-5-high': 'MODEL_PLACEHOLDER_M405',
+  'claude-sonnet-5-5-medium': 'MODEL_PLACEHOLDER_M404',
+  'claude-sonnet-5-5-low': 'MODEL_PLACEHOLDER_M403',
+  'gpt-oss-120b-medium': 'MODEL_OPENAI_GPT_OSS_120B_MEDIUM',
+  // Internal ids: recorded because the capture issues a real enum for them, but isInternalModel
+  // keeps them out of the catalog, so they can never be selected.
+  'chat_20706': 'MODEL_CHAT_20706',
+  'chat_23310': 'MODEL_CHAT_23310',
+  'tab_flash_lite_preview': 'MODEL_PLACEHOLDER_M19',
+  'tab_jump_flash_lite_preview': 'MODEL_PLACEHOLDER_M28',
+  // No row here for `gemini-3.5-flash-extra-low`, `gemini-3.5-flash-low`, `gemini-3-flash-agent`,
+  // `gemini-3.1-pro-low` or `gemini-pro-agent` (five rows deleted on 2026-11-18, reviewer2
+  // finding B3). They were inherited as "confirmed pairs", and nothing in this repo confirms
+  // them: the fixture does not list those wire ids, ops/relink/t2-model-enum-evidence.md evidences
+  // only M526/M418, and /usr/bin/agy contains the wire ids (1-3 occurrences each) and
+  // placeholder *names* such as MODEL_PLACEHOLDER_M187 (3 occurrences) without ever pairing one
+  // name to one wire id. The wire ids themselves are real — ANTIGRAVITY_ROUTING below issues
+  // them — so they stay, but their enum is unknown: lookupModelEnum returns undefined and
+  // client.ts antigravityRequestEnvelope omits `labels.model_enum` rather than sending a
+  // back-computed guess.
 }
+
+/**
+ * Suffixes agy appends to a family wire id to select a reasoning effort / tier.
+ * Longest first so `-tiered-xhigh` peels off before a bare `-xhigh` could match it.
+ */
+const AGY_MODEL_VARIANT_SUFFIXES: readonly string[] = [
+  'tiered-xhigh',
+  'tiered-high',
+  'tiered-medium',
+  'tiered-low',
+  'tiered',
+  'extra-low',
+  'extra-high',
+  'xhigh',
+  'high',
+  'low',
+  'medium',
+  'minimal',
+  'thinking',
+  'trial',
+  'sonar',
+]
+
+/**
+ * Resolve the wire model enum (model_enum label) for a wire model id.
+ *
+ * Exact row first, family row second. `gemini-4-hydrogen-high` (own row, M525) and
+ * `gemini-4-hydrogen-tiered-xhigh` (own row, M531) resolve directly and never fall back —
+ * a measured suffixed id always keeps its own value. A family row takes over only for a
+ * variant the table does not list, by peeling the effort / tier suffixes that belong to the
+ * request's `model` string: `gemini-4-hydrogen-tiered-low` and `gemini-4-hydrogen-tiered-medium`
+ * -> `MODEL_PLACEHOLDER_M526` (via the `gemini-4-hydrogen` row), `gemini-4-argon-xhigh`
+ * -> `MODEL_PLACEHOLDER_M418` (via the `gemini-4-argon` row). Evidence for those family rows:
+ * ops/relink/t2-model-enum-evidence.md.
+ * Returns `undefined` for a family this repo has no measured pair for (never a guess).
+ */
+export function lookupModelEnum(wireModelId: string): string | undefined {
+  const trimmed = wireModelId.trim().toLowerCase()
+  if (trimmed === '') return undefined
+
+  const queue: string[] = [trimmed]
+  const visited = new Set<string>()
+  for (let i = 0; i < queue.length; i += 1) {
+    const candidate = queue[i]
+    if (candidate === undefined || candidate === '' || visited.has(candidate)) continue
+    visited.add(candidate)
+
+    const hit = AGY_MODEL_ENUM_BY_WIRE_ID[candidate]
+    if (hit !== undefined) return hit
+
+    for (const suffix of AGY_MODEL_VARIANT_SUFFIXES) {
+      const tail = `-${suffix}`
+      if (!candidate.endsWith(tail)) continue
+      const base = candidate.slice(0, -tail.length)
+      if (base !== '') queue.push(base)
+    }
+  }
+  return undefined
+}
+
+/**
+ * @deprecated Legacy alias kept for existing imports (client.ts labels); it is now derived
+ * from {@link AGY_MODEL_ENUM_BY_WIRE_ID}. New call sites should use {@link lookupModelEnum},
+ * which also resolves effort-suffixed wire ids.
+ */
+export const ANTIGRAVITY_MODEL_ENUM: Record<string, string> = { ...AGY_MODEL_ENUM_BY_WIRE_ID }
 
 export interface AntigravityRouting {
   off?: string
@@ -614,6 +773,62 @@ export const ANTIGRAVITY_ROUTING: Record<string, AntigravityRouting> = {
       xhigh: 'claude-sonnet-4-6',
     },
     defaultRequestId: 'claude-sonnet-4-6',
+  },
+  // agy rejects --effort for the Claude families (see the note at the top of this file), so
+  // every effort maps to the single confirmed wire id and no effort suffix can leak into it.
+  'claude-haiku-4-5': {
+    off: 'claude-haiku-4-5',
+    routing: {
+      minimal: 'claude-haiku-4-5',
+      low: 'claude-haiku-4-5',
+      medium: 'claude-haiku-4-5',
+      high: 'claude-haiku-4-5',
+      xhigh: 'claude-haiku-4-5',
+    },
+    defaultRequestId: 'claude-haiku-4-5',
+  },
+  // claude-opus-4-8 is a confirmed 1.3.5 wire id, but resolveModelSlug() deliberately aliases
+  // it to claude-opus-4-6-thinking (locked by test/models.test.ts:255). The row mirrors that
+  // alias so the key exists for the family without changing any request id.
+  'claude-opus-4-8': {
+    off: 'claude-opus-4-6-thinking',
+    routing: {
+      minimal: 'claude-opus-4-6-thinking',
+      low: 'claude-opus-4-6-thinking',
+      medium: 'claude-opus-4-6-thinking',
+      high: 'claude-opus-4-6-thinking',
+      xhigh: 'claude-opus-4-6-thinking',
+    },
+    defaultRequestId: 'claude-opus-4-6-thinking',
+  },
+  // gemini-4 families. Wire ids taken from the agy 1.3.5 string table / captured traffic
+  // (gemini-4-hydrogen-low|-medium|-high|-xhigh, gemini-4-argon-low|-medium|-high; there is
+  // no -minimal or -xhigh wire id for argon, so minimal falls to -low and xhigh to -high).
+  // The default/off id is the one agy itself sends for the family: the captured agent request
+  // uses gemini-4-hydrogen-medium (ops/relink/t2-traffic-findings.md:57/108). Must stay in
+  // step with deriveEffortsForModel(), which yields low|medium|high|xhigh for hydrogen and
+  // low|medium|high for argon.
+  'gemini-4-hydrogen': {
+    off: 'gemini-4-hydrogen-medium',
+    routing: {
+      minimal: 'gemini-4-hydrogen-low',
+      low: 'gemini-4-hydrogen-low',
+      medium: 'gemini-4-hydrogen-medium',
+      high: 'gemini-4-hydrogen-high',
+      xhigh: 'gemini-4-hydrogen-xhigh',
+    },
+    defaultRequestId: 'gemini-4-hydrogen-medium',
+  },
+  'gemini-4-argon': {
+    off: 'gemini-4-argon-medium',
+    routing: {
+      minimal: 'gemini-4-argon-low',
+      low: 'gemini-4-argon-low',
+      medium: 'gemini-4-argon-medium',
+      high: 'gemini-4-argon-high',
+      xhigh: 'gemini-4-argon-high',
+    },
+    defaultRequestId: 'gemini-4-argon-medium',
   },
   'gemini-3.1-pro': {
     off: 'gemini-3.1-pro-low',

@@ -26,7 +26,14 @@ test('1. agyUserAgent outputs verbatim upstream CLI identity and fetchAvailableM
   const server = createServer((req, res) => {
     capturedUA = req.headers['user-agent']
     res.writeHead(200, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify({ models: {} }))
+    // Fixture-only: QuotaService resolves the project through loadCodeAssist before it will
+    // send either query RPC, so the host has to name one the way the real backend does
+    // (cloudaicompanionProject, ops/relink/t2-traffic-findings.md #2.4). Without it no query
+    // request is sent at all and the User-Agent assertion below would test nothing.
+    const payload = (req.url ?? '').includes('loadCodeAssist')
+      ? { cloudaicompanionProject: 'aicode-consumers' }
+      : { models: {} }
+    res.end(JSON.stringify(payload))
   })
 
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
@@ -75,6 +82,15 @@ test('3. fetchAvailableModels fallback: 403 on first endpoint continues to secon
       return
     }
     if (url.includes('endpoint2')) {
+      // Fixture-only: the project lookup runs over the same endpoint list, so the host has to
+      // name a project (as the real backend does) for the query RPCs to be sent at all.
+      // `secondCalled` stays reserved for the query RPC, so the 403-fallback assertion below
+      // can still only be satisfied by an actual fallback.
+      if (url.includes('loadCodeAssist')) {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ cloudaicompanionProject: 'aicode-consumers' }))
+        return
+      }
       secondCalled = true
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ models: { 'gemini-3.8-flash': { displayName: 'Gemini 3.8 Flash' } } }))

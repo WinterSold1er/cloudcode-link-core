@@ -1,7 +1,7 @@
 // OAuth (self-owned Antigravity / Google Cloud Code authorization flow).
 import { createHash, randomBytes } from 'node:crypto'
 import { createServer, type Server } from 'node:http'
-import { mkdirSync, writeFileSync, chmodSync } from 'node:fs'
+import { mkdirSync, readFileSync, writeFileSync, chmodSync } from 'node:fs'
 import { join } from 'node:path'
 import { execFile } from 'node:child_process'
 import { agyFetch } from './net.ts'
@@ -19,13 +19,132 @@ export function resolveClientCredentials(): { clientId: string; clientSecret: st
   }
 }
 
+/**
+ * Consent-time scope set, aligned with what the real `agy` 1.3.5 CLI requests.
+ *
+ * Evidence (`strings -a /usr/bin/agy`, read-only inspection, 2026-11-18): the binary
+ * carries exactly 16 distinct `https://www.googleapis.com/auth/*` strings, split into
+ * two families:
+ *   - CLI auth family (6): cloud-platform, userinfo.email, userinfo.profile, cclog,
+ *     experimentsandconfigs, aicode  -> this constant
+ *   - Drive integration family (10): drive, drive.appdata, drive.apps.readonly,
+ *     drive.file, drive.meet.readonly, drive.metadata, drive.metadata.readonly,
+ *     drive.photos.readonly, drive.readonly, drive.scripts
+ * The Drive family backs agy's Drive/workspace project features and is deliberately
+ * NOT requested here: it widens the consent screen for our shared client, a scope the
+ * client is not registered for makes Google reject the whole authorize request, and the
+ * AICode path needs none of it. `aicode` is what closes the observed gap — a token
+ * minted from the previous set gets `403 PERMISSION_DENIED /
+ * Request had insufficient authentication scopes / ACCESS_TOKEN_SCOPE_INSUFFICIENT`
+ * from the AICode backend that `use-aicode-mendel=true` routes agy through.
+ *
+ * Only scopes were added, none removed: dropping a scope changes the behaviour of
+ * refresh_tokens that were issued with it.
+ */
 export const AGY_SCOPES: readonly string[] = [
+  'https://www.googleapis.com/auth/cloud-platform',
+  'https://www.googleapis.com/auth/aicode',
+  'https://www.googleapis.com/auth/userinfo.email',
+  'https://www.googleapis.com/auth/userinfo.profile',
+  'https://www.googleapis.com/auth/cclog',
+  'https://www.googleapis.com/auth/experimentsandconfigs',
+]
+
+/**
+ * The set AGY_SCOPES held before `aicode` was added. Tokens written before a scope
+ * record existed were authorized with exactly this set, so it is the assumption used
+ * for an unrecorded grant (see {@link needsReauth}). Kept as an explicit constant so
+ * the fallback is auditable instead of implicit.
+ */
+export const LEGACY_AGY_SCOPES: readonly string[] = [
   'https://www.googleapis.com/auth/cloud-platform',
   'https://www.googleapis.com/auth/userinfo.email',
   'https://www.googleapis.com/auth/userinfo.profile',
   'https://www.googleapis.com/auth/cclog',
   'https://www.googleapis.com/auth/experimentsandconfigs',
 ]
+
+/**
+ * Key that records the authorized scope set inside the on-disk agy token document.
+ * `granted_scopes` is a repeated string field in agy's own credential protos
+ * (`strings -a /usr/bin/agy` shows `protobuf:"...,rep,name=granted_scopes..."`), so a
+ * string array under this name matches agy's field name and its type: agy's JSON/protobuf
+ * reader ignores unknown keys, and this one is not a type clash with a key it already uses.
+ */
+export const AGY_TOKEN_SCOPE_KEY = 'granted_scopes'
+
+/**
+ * Canonicalize a scope collection: trim, drop empties, de-duplicate, and order it
+ * deterministically (scopes required by agy in AGY_SCOPES declaration order, any extra
+ * scope after them in ascending byte order). Same input set -> same output regardless
+ * of the input order, so a stored grant can be compared to the required set reliably.
+ */
+export function normalizeScopes(input?: readonly string[] | string | null): string[] {
+  const raw = typeof input === 'string' ? input.split(/[\s,]+/) : (input ?? [])
+  const unique = new Set<string>()
+  for (const entry of raw) {
+    const trimmed = typeof entry === 'string' ? entry.trim() : ''
+    if (trimmed) unique.add(trimmed)
+  }
+  const rank = new Map<string, number>(AGY_SCOPES.map((scope, index) => [scope, index]))
+  return [...unique].sort((a, b) => {
+    const rankA = rank.get(a) ?? Number.MAX_SAFE_INTEGER
+    const rankB = rank.get(b) ?? Number.MAX_SAFE_INTEGER
+    if (rankA !== rankB) return rankA - rankB
+    return a < b ? -1 : a > b ? 1 : 0
+  })
+}
+
+/** Required scopes missing from `granted`. */
+export function missingScopes(
+  granted: readonly string[] | string | null | undefined,
+  required: readonly string[] = AGY_SCOPES,
+): string[] {
+  const have = new Set(normalizeScopes(granted))
+  return required.filter((scope) => !have.has(scope))
+}
+
+/**
+ * True when the stored grant cannot satisfy the current AGY_SCOPES.
+ *
+ * Refreshing a refresh_token never widens the grant — Google re-issues an access token
+ * for the scopes the consent already covered, and the refresh response carries no scope
+ * field. So a token authorized with an older set stays short until the user reconsents;
+ * callers use this to decide whether to surface a re-auth (`/ccl auth`) prompt.
+ * A grant with no recorded scope is treated as {@link LEGACY_AGY_SCOPES}: that is what
+ * the consent asked for when the token was issued, and it is the safe reading (a stale
+ * prompt costs one re-auth; a false "no re-auth needed" keeps a 403 token in the pool).
+ */
+export function needsReauth(grantedScopes: readonly string[] | string | null | undefined): boolean {
+  const unrecorded =
+    grantedScopes === undefined ||
+    grantedScopes === null ||
+    (Array.isArray(grantedScopes) && grantedScopes.length === 0)
+  return missingScopes(unrecorded ? LEGACY_AGY_SCOPES : grantedScopes).length > 0
+}
+
+/**
+ * Read the authorized scope set back out of a parsed agy token document.
+ * Tolerates both shapes seen in the wild — a top-level record and one nested inside
+ * `token` — and both encodings (string array, space-separated string).
+ * Returns undefined when the document records no scopes (a pre-scope-record token).
+ */
+export function readGrantedScopes(raw: Record<string, unknown> | null | undefined): string[] | undefined {
+  if (!raw || typeof raw !== 'object') return undefined
+  const nested = raw.token
+  const documents: Record<string, unknown>[] = [raw]
+  if (nested && typeof nested === 'object' && !Array.isArray(nested)) documents.push(nested as Record<string, unknown>)
+  for (const document of documents) {
+    for (const key of [AGY_TOKEN_SCOPE_KEY, 'scopes', 'scope']) {
+      const value = document[key]
+      if (typeof value === 'string' || Array.isArray(value)) {
+        const normalized = normalizeScopes(value)
+        if (normalized.length > 0) return normalized
+      }
+    }
+  }
+  return undefined
+}
 
 export const OAUTH_AUTHORIZE_URL = 'https://accounts.google.com/o/oauth2/v2/auth'
 export const OAUTH_TOKEN_URL = 'https://oauth2.googleapis.com/token'
@@ -77,6 +196,14 @@ export interface TokenSet {
   token_type?: string
   refresh_token?: string
   expiryMs?: number
+  /**
+   * Scopes the token endpoint actually reported. Recorded only from a response that carried a
+   * `scope` field: a code exchange whose response omits it leaves the grant unrecorded instead of
+   * claiming the consent-time request, and a refresh response never carries scope (the previously
+   * recorded grant stays authoritative). "Unrecorded" is a real state, not a gap:
+   * {@link needsReauth} judges it as a legacy grant and asks for one re-consent.
+   */
+  grantedScopes?: string[]
 }
 
 interface TokenEndpointPayload {
@@ -84,6 +211,7 @@ interface TokenEndpointPayload {
   token_type?: string
   refresh_token?: string
   expires_in?: number
+  scope?: string
   error?: string | { message?: string; status?: string }
   error_description?: string
 }
@@ -106,18 +234,26 @@ async function postTokenForm(fields: Record<string, string>, proxyUrl?: string):
   return payload
 }
 
-function toTokenSet(payload: TokenEndpointPayload, refreshTokenFallback?: string): TokenSet {
+/**
+ * Translate one token-endpoint response into a TokenSet. `scope` is the only place a grant is
+ * learned from, so it is the only thing recorded; exported because the meaning of a response
+ * without it is a contract worth testing directly (see test/agy-oauth-scope.test.ts) and the
+ * exchange path itself needs the network.
+ */
+export function toTokenSet(payload: TokenEndpointPayload, refreshTokenFallback?: string): TokenSet {
+  const grantedScopes = payload.scope === undefined ? undefined : normalizeScopes(payload.scope)
   return {
     access_token: payload.access_token as string,
     token_type: payload.token_type ?? 'Bearer',
     refresh_token: payload.refresh_token ?? refreshTokenFallback,
     expiryMs: typeof payload.expires_in === 'number' ? Date.now() + payload.expires_in * 1000 : undefined,
+    ...(grantedScopes && grantedScopes.length > 0 ? { grantedScopes } : {}),
   }
 }
 
 /** Exchange an authorization code for tokens (PKCE-verified). */
 export async function exchangeCode(code: string, verifier: string, proxyUrl?: string, redirectUri: string = OAUTH_REDIRECT_URI): Promise<TokenSet> {
-  return toTokenSet(
+  const tokens = toTokenSet(
     await postTokenForm({
       grant_type: 'authorization_code',
       code: code.trim(),
@@ -125,9 +261,23 @@ export async function exchangeCode(code: string, verifier: string, proxyUrl?: st
       code_verifier: verifier,
     }, proxyUrl),
   )
+  // Only a scope Google actually echoed is recorded. A code-exchange response without `scope`
+  // leaves the grant unrecorded, and an unrecorded grant is precisely the case needsReauth judges
+  // as a legacy / pre-scope token: re-auth required. Claiming AGY_SCOPES here — because the
+  // consent URL asked for them — would assert a grant this client never saw, and needsReauth would
+  // then answer "no re-auth needed" for a token whose real scopes are unknown. That false
+  // negative is what keeps a scope-insufficient token (403
+  // ACCESS_TOKEN_SCOPE_INSUFFICIENT) in the pool instead of prompting one re-consent.
+  return tokens
 }
 
-/** Refresh an access token; throws on invalid_grant (credential revoked). */
+/** Refresh an access token; throws on invalid_grant (credential revoked).
+ *
+ * A refresh response carries no `scope` field, so `grantedScopes` stays unset: a refresh
+ * re-issues an access token for the scopes the original consent covered, it never widens
+ * them. Callers keep the recorded grant (or use `needsReauth`) instead of assuming a
+ * refreshed token gained anything.
+ */
 export async function refreshTokens(refreshToken: string, proxyUrl?: string): Promise<TokenSet> {
   return toTokenSet(
     await postTokenForm({ grant_type: 'refresh_token', refresh_token: refreshToken }, proxyUrl),
@@ -149,9 +299,22 @@ export async function fetchUserEmail(accessToken: string, proxyUrl?: string): Pr
   }
 }
 
+/** Parse an existing on-disk token document; undefined when it is absent or unreadable. */
+function readTokenDocument(file: string): Record<string, unknown> | undefined {
+  try {
+    const raw = JSON.parse(readFileSync(file, 'utf8')) as unknown
+    return raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : undefined
+  } catch {
+    return undefined
+  }
+}
+
 /**
  * Persist tokens in on-disk format:
- *   {"token": {access_token, token_type, refresh_token, expiry}, "auth_method": "consumer"}
+ *   {"token": {access_token, token_type, refresh_token, expiry}, "auth_method": "consumer",
+ *    "granted_scopes": [ ... ] }
+ * The `granted_scopes` entry is only present once the grant is known; a token file written
+ * before scope recording existed stays exactly as it was, so existing accounts keep working.
  */
 export function writeAgyTokenFile(homeDir: string, tokens: TokenSet): string {
   const geminiDir = join(homeDir, '.gemini')
@@ -166,6 +329,9 @@ export function writeAgyTokenFile(homeDir: string, tokens: TokenSet): string {
   const expiryIso = tokens.expiryMs
     ? formatLocalIso(tokens.expiryMs)
     : formatLocalIso(Date.now() + 3600_000)
+  // A refreshed TokenSet carries no scope information, so a rewrite must not erase what
+  // the original consent recorded.
+  const grantedScopes = normalizeScopes(tokens.grantedScopes ?? readGrantedScopes(readTokenDocument(file)))
   const doc = {
     token: {
       access_token: tokens.access_token,
@@ -174,6 +340,7 @@ export function writeAgyTokenFile(homeDir: string, tokens: TokenSet): string {
       expiry: expiryIso,
     },
     auth_method: 'consumer',
+    ...(grantedScopes.length > 0 ? { [AGY_TOKEN_SCOPE_KEY]: grantedScopes } : {}),
   }
   writeFileSync(file, JSON.stringify(doc), { encoding: 'utf8', mode: 0o600 })
   try {
