@@ -918,6 +918,68 @@ export const ANTIGRAVITY_ROUTING: Record<string, AntigravityRouting> = {
     },
     defaultRequestId: 'gemini-4-hydrogen-sonar',
   },
+  // Legacy models that reach the catalog through the server-side signal union (they appear in the
+  // captured FetchAvailableModels response with their own quotaInfo and their own base enum row:
+  // gemini-3-flash -> M18, gemini-3.5-flash-lite -> M198, gemini-3.1-flash-image -> M21,
+  // gemini-3.1-flash-lite -> M50) but for which agy has never published an effort variant: none of
+  // `gemini-3-flash-low|-medium|-xhigh`, `gemini-3.5-flash-lite-*`, `gemini-3.1-flash-image-*` or
+  // `gemini-3.1-flash-lite-*` exists in the 1.3.5 string table or in any captured request.
+  // Measured on the bare slug instead: each of the four answers HTTP 200 with SSE text, echoes
+  // `modelVersion` equal to the requested id, and finishes STOP (one call per id on n0tdx free tier
+  // and once on pqxkh standard tier). So identity routing is the evidenced mapping, and these rows
+  // exist for exactly that reason: without them the generic Gemini branch in
+  // getAntigravityRequestModelId() appends an effort and invents a wire id agy has never advertised,
+  // which pairs a non-existent request string with the base enum (M18/M198/M21/M50) and answers
+  // 400/403, quarantining the account for 5-30 min. No effort suffix may be fabricated here.
+  'gemini-3-flash': {
+    off: 'gemini-3-flash',
+    routing: {
+      minimal: 'gemini-3-flash',
+      low: 'gemini-3-flash',
+      medium: 'gemini-3-flash',
+      high: 'gemini-3-flash',
+      xhigh: 'gemini-3-flash',
+    },
+    defaultRequestId: 'gemini-3-flash',
+  },
+  'gemini-3.5-flash-lite': {
+    off: 'gemini-3.5-flash-lite',
+    routing: {
+      minimal: 'gemini-3.5-flash-lite',
+      low: 'gemini-3.5-flash-lite',
+      medium: 'gemini-3.5-flash-lite',
+      high: 'gemini-3.5-flash-lite',
+      xhigh: 'gemini-3.5-flash-lite',
+    },
+    defaultRequestId: 'gemini-3.5-flash-lite',
+  },
+  'gemini-3.1-flash-image': {
+    off: 'gemini-3.1-flash-image',
+    routing: {
+      minimal: 'gemini-3.1-flash-image',
+      low: 'gemini-3.1-flash-image',
+      medium: 'gemini-3.1-flash-image',
+      high: 'gemini-3.1-flash-image',
+      xhigh: 'gemini-3.1-flash-image',
+    },
+    defaultRequestId: 'gemini-3.1-flash-image',
+  },
+  'gemini-3.1-flash-lite': {
+    off: 'gemini-3.1-flash-lite',
+    routing: {
+      minimal: 'gemini-3.1-flash-lite',
+      low: 'gemini-3.1-flash-lite',
+      medium: 'gemini-3.1-flash-lite',
+      high: 'gemini-3.1-flash-lite',
+      xhigh: 'gemini-3.1-flash-lite',
+    },
+    defaultRequestId: 'gemini-3.1-flash-lite',
+  },
+  // gemini-2.5-flash / -flash-lite / -flash-thinking / -pro need no row: the generic branch leaves a
+  // `gemini-2.` id untouched (the version regex starts at 3), so they are already sent as bare slugs.
+  // gemini-2.5-pro does resolve upstream but answers 503 MODEL_CAPACITY_EXHAUSTED (error_number 2010),
+  // which is an upstream capacity state, not a routing problem - inventing an effort variant for it
+  // would hide that, so it stays a bare slug.
   'gemini-4-argon': {
     off: 'gemini-4-argon-medium',
     routing: {
