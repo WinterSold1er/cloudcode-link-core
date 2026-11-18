@@ -31,21 +31,43 @@ export interface Catalog {
   endpointErrors?: readonly string[]
 }
 
-export function prettifyModelSlug(slug: string): string {
-  if (!slug) return ''
-  const normalized = slug.trim().replace(/(\d+)-(\d+)/g, '$1.$2')
-  const tokens = normalized.split(/[-_]+/)
-  const formatted = tokens.map((token) => {
-    const lower = token.toLowerCase()
-    if (lower === 'gpt') return 'GPT'
-    if (lower === 'oss') return 'OSS'
-    if (/^\d+b$/i.test(lower)) return lower.toUpperCase()
-    if (/^\d+(?:\.\d+)?$/.test(token)) return token
-    return token.charAt(0).toUpperCase() + token.slice(1).toLowerCase()
-  })
-  return formatted.join(' ')
+/**
+ * Names for ids the server ships without any `displayName`. Their shape follows the labels the
+ * server itself uses for the siblings of the same family in the same capture — the capture labels
+ * `gemini-4-hydrogen-high` as "Gemini 4 Hydrogen (High)" and `gemini-4-hydrogen-xhigh` as
+ * "Gemini 4 Hydrogen (XHigh)" — so the sonar sibling reads alike. The name states nothing about
+ * capabilities beyond what the capture reports (`supportsThinking: true`, `thinkingLevel: 1`).
+ */
+const UNLABELED_MODEL_NAMES: Readonly<Record<string, string>> = {
+  'gemini-4-hydrogen-sonar': 'Gemini 4 Hydrogen (Sonar)',
 }
 
+function prettifyToken(token: string): string {
+  const lower = token.toLowerCase()
+  if (lower === 'gpt') return 'GPT'
+  if (lower === 'oss') return 'OSS'
+  if (/^\d+b$/i.test(lower)) return lower.toUpperCase()
+  if (/^\d+(?:\.\d+)?$/.test(token)) return token
+  return token.charAt(0).toUpperCase() + token.slice(1).toLowerCase()
+}
+
+export function prettifyModelSlug(slug: string): string {
+  if (!slug) return ''
+  const key = slug.trim().toLowerCase()
+  const serverName = UNLABELED_MODEL_NAMES[key]
+  if (serverName !== undefined) return serverName
+  const normalized = slug.trim().replace(/(\d+)-(\d+)/g, '$1.$2')
+  const tokens = normalized.split(/[-_]+/)
+  return tokens.map(prettifyToken).join(' ')
+}
+
+/**
+ * Slugs that are never a user-selectable model: server-internal families (`chat_*`, `tab_*`),
+ * preview builds, ids the server marks `...-disabled`, and tiered-group ids (`-tiered-`), which
+ * fold into their base model instead of appearing on their own.
+ * `gemini-4-hydrogen-sonar` is deliberately NOT internal — the server publishes it with live quota
+ * and it answers live requests; see the note on MODEL_UNSERVABLE_SUFFIXES in pool.ts.
+ */
 export function isInternalModel(slug: string): boolean {
   const s = slug.trim().toLowerCase()
   return (
@@ -53,7 +75,7 @@ export function isInternalModel(slug: string): boolean {
     /^tab[_-]/i.test(s) ||
     /_preview$/i.test(s) ||
     /-preview$/i.test(s) ||
-    /-(?:disabled|sonar)(?:-|$)/i.test(s) ||
+    /-disabled(?:-|$)/i.test(s) ||
     /-tiered-/i.test(s)
   )
 }
@@ -102,6 +124,44 @@ function dedupeBySlug(raw: readonly RawModel[]): RawModel[] {
   return out
 }
 
+/**
+ * A model the server published with a live quota but placed in no display group. The gate is
+ * explicit server data - a numeric `quotaInfo.remainingFraction` on an entry the server did not
+ * mark `disabled` / `enabled: false` / `isInternal` - never a match on the slug's spelling.
+ * This is how an upstream-hidden but measurable model (`gemini-4-hydrogen-sonar`) reaches the
+ * catalog without inventing a name-based allow list.
+ */
+function isQuotaPublishedModel(entry: Record<string, unknown> | undefined): boolean {
+  if (!entry || typeof entry !== 'object') return false
+  if (entry.disabled === true || entry.enabled === false || entry.isInternal === true) return false
+  const quota = entry.quotaInfo
+  if (!quota || typeof quota !== 'object') return false
+  const fraction = (quota as Record<string, unknown>).remainingFraction
+  return typeof fraction === 'number' && Number.isFinite(fraction)
+}
+
+/** The label the server itself supplies for a models-dict entry, if it supplies one at all. */
+function serverDisplayName(entry: Record<string, unknown> | undefined): string {
+  if (!entry || typeof entry !== 'object') return ''
+  return (typeof entry.displayName === 'string' && entry.displayName.trim() !== '') ? entry.displayName.trim()
+    : (typeof entry.display_name === 'string' && entry.display_name.trim() !== '') ? entry.display_name.trim()
+    : (typeof entry.modelName === 'string' && entry.modelName.trim() !== '') ? entry.modelName.trim()
+    : (typeof entry.name === 'string' && entry.name.trim() !== '') ? entry.name.trim()
+    : ''
+}
+
+/** Server labels claimed by more than one slug; such a label is not a usable name for any of them. */
+function sharedServerLabels(labels: readonly string[]): Set<string> {
+  const owners = new Set<string>()
+  const shared = new Set<string>()
+  for (const label of labels) {
+    if (label === '') continue
+    if (owners.has(label)) shared.add(label)
+    else owners.add(label)
+  }
+  return shared
+}
+
 function extractModelList(parsed: unknown): RawModel[] | null {
   let arr: unknown[] | null = null;
   if (Array.isArray(parsed)) arr = parsed;
@@ -133,6 +193,7 @@ function extractModelList(parsed: unknown): RawModel[] | null {
       if (sortedIds.length > 0) {
         const out: RawModel[] = []
         const seen = new Set<string>()
+        const sortLabels: string[] = []
         for (const mid of sortedIds) {
           if (seen.has(mid)) continue
           seen.add(mid)
@@ -140,14 +201,34 @@ function extractModelList(parsed: unknown): RawModel[] | null {
           const entry = modelsMap?.[mid]
           if (entry && (entry.disabled === true || entry.enabled === false)) continue
 
-          const rawLabel =
-            (typeof entry?.displayName === 'string' && entry.displayName.trim() !== '') ? entry.displayName.trim()
-            : (typeof entry?.display_name === 'string' && entry.display_name.trim() !== '') ? entry.display_name.trim()
-            : (typeof entry?.modelName === 'string' && entry.modelName.trim() !== '') ? entry.modelName.trim()
-            : (typeof entry?.name === 'string' && entry.name.trim() !== '') ? entry.name.trim()
-            : ''
+          const rawLabel = serverDisplayName(entry)
           const label = rawLabel !== '' && rawLabel !== mid ? rawLabel : prettifyModelSlug(mid)
           out.push({ slug: mid, label })
+          sortLabels.push(rawLabel)
+        }
+
+        // Union step: models the server published with a live quota but placed in no
+        // agentModelSorts group. agy's own picker hides them — the measured case is
+        // gemini-4-hydrogen-sonar, which carries its own quotaInfo (remainingFraction ~1 and a
+        // resetTime) and answers live generation requests, yet appears in no sort group, no
+        // tieredModelIds list and no defaultAgentModelId. The gate is therefore the server's own
+        // signal (numeric quotaInfo.remainingFraction, no disabled / enabled:false / isInternal
+        // flag), never a match on the slug's name.
+        const published: Array<{ slug: string; rawLabel: string }> = []
+        for (const [key, entry] of Object.entries(modelsMap ?? {})) {
+          const slug = typeof key === 'string' ? key.trim() : ''
+          if (slug === '' || seen.has(slug)) continue
+          if (!entry || typeof entry !== 'object' || !isQuotaPublishedModel(entry)) continue
+          if (isInternalModel(slug)) continue
+          seen.add(slug)
+          published.push({ slug, rawLabel: serverDisplayName(entry) })
+        }
+        const sharedLabels = sharedServerLabels([...sortLabels, ...published.map((p) => p.rawLabel)])
+        for (const item of published) {
+          const label = item.rawLabel !== '' && item.rawLabel !== item.slug && !sharedLabels.has(item.rawLabel)
+            ? item.rawLabel
+            : prettifyModelSlug(item.slug)
+          out.push({ slug: item.slug, label })
         }
         if (out.length > 0) return out
       }
@@ -165,12 +246,7 @@ function extractModelList(parsed: unknown): RawModel[] | null {
         if (isInternalModel(trimmedKey)) continue
         const v = (val && typeof val === 'object' ? val : {}) as Record<string, unknown>
         if (v.disabled === true || v.enabled === false) continue
-        const rawLabel =
-          (typeof v.displayName === 'string' && v.displayName.trim() !== '') ? v.displayName.trim()
-          : (typeof v.display_name === 'string' && v.display_name.trim() !== '') ? v.display_name.trim()
-          : (typeof v.modelName === 'string' && v.modelName.trim() !== '') ? v.modelName.trim()
-          : (typeof v.name === 'string' && v.name.trim() !== '') ? v.name.trim()
-          : ''
+        const rawLabel = serverDisplayName(v)
         if (rawLabel !== '') {
           if (labelOwners.has(rawLabel)) {
             duplicateLabels.add(rawLabel)
@@ -259,8 +335,14 @@ function stripTieredLabel(label: string): string {
   return label.replace(/\s*\((?:Tiered|tiered)\)\s*$/i, '').replace(/\s+(?:Tiered|tiered)\s*$/i, '').trim()
 }
 
+/**
+ * Guard for Gemini folding. `-tiered` / `-disabled` variants are never a fold target. A
+ * `...-sonar` id is NOT a variant of its prefix: it is a model with its own wire id and no effort
+ * ladder, so it must survive as its own (verbatim) catalog entry rather than fold into
+ * `gemini-4-hydrogen`, which would produce a second entry with the same catalog id.
+ */
 function isValidGeminiBase(base: string): boolean {
-  return !base.includes('-tiered') && !base.includes('-sonar') && !base.includes('-disabled')
+  return !base.includes('-tiered') && !base.includes('-disabled')
 }
 
 /** Fold Gemini effort variants into base + effort set (spec ADR-10). */
@@ -818,6 +900,23 @@ export const ANTIGRAVITY_ROUTING: Record<string, AntigravityRouting> = {
       xhigh: 'gemini-4-hydrogen-xhigh',
     },
     defaultRequestId: 'gemini-4-hydrogen-medium',
+  },
+  // gemini-4-hydrogen-sonar is a model of its own, not a rung of the hydrogen ladder: the capture
+  // gives it its own wire id (enum MODEL_PLACEHOLDER_M578) and a fixed `thinkingLevel: 1` with no
+  // effort variants, and the live request echoes back `modelVersion: gemini-4-hydrogen-sonar`.
+  // Every effort level therefore routes to the same id. Without this row the generic Gemini branch
+  // in getAntigravityRequestModelId() appends an effort and invents `gemini-4-hydrogen-sonar-low`,
+  // a wire id agy has never advertised.
+  'gemini-4-hydrogen-sonar': {
+    off: 'gemini-4-hydrogen-sonar',
+    routing: {
+      minimal: 'gemini-4-hydrogen-sonar',
+      low: 'gemini-4-hydrogen-sonar',
+      medium: 'gemini-4-hydrogen-sonar',
+      high: 'gemini-4-hydrogen-sonar',
+      xhigh: 'gemini-4-hydrogen-sonar',
+    },
+    defaultRequestId: 'gemini-4-hydrogen-sonar',
   },
   'gemini-4-argon': {
     off: 'gemini-4-argon-medium',

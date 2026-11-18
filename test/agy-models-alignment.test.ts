@@ -372,7 +372,10 @@ test('9. catalog visibility: gemini-4 effort variants stay selectable, internal 
   assert.equal(isInternalModel('gemini-4-hydrogen'), false)
   assert.equal(isInternalModel('gemini-4-argon-high'), false)
 
-  assert.equal(isInternalModel('gemini-4-hydrogen-sonar'), true)
+  // gemini-4-hydrogen-sonar is not internal: the capture publishes it with its own quotaInfo
+  // (remainingFraction ~1, resetTime) and no disabled flag, and live requests generate against it.
+  // It is simply a model without an effort ladder.
+  assert.equal(isInternalModel('gemini-4-hydrogen-sonar'), false)
   assert.equal(isInternalModel('gemini-4-hydrogen-tiered-high'), true)
   assert.equal(isInternalModel('gemini-4-hydrogen-tiered-xhigh'), true)
   assert.equal(isInternalModel('gemini-4-carbon-disabled'), true)
@@ -384,8 +387,24 @@ test('10. foldEfforts folds the real fixture into one gemini-4-hydrogen entry wi
   const ids = catalog.map((e) => e.id)
 
   assert.ok(!ids.includes('gemini-4-hydrogen-high'), 'variants must fold, not appear verbatim')
-  assert.ok(!ids.some((id) => id.includes('tiered') || id.includes('sonar') || id.includes('disabled')),
+  assert.ok(!ids.some((id) => id.includes('tiered') || id.includes('disabled')),
     'internal variants must not reach the catalog')
+
+  // ...but gemini-4-hydrogen-sonar must: the capture publishes it with its own quotaInfo and no
+  // disabled flag, and the CLI answers live requests with modelVersion gemini-4-hydrogen-sonar.
+  // It has no effort ladder, so it stays a verbatim entry with its own enum.
+  const sonar = catalog.find((e) => e.id === 'gemini-4-hydrogen-sonar')
+  assert.ok(sonar, 'gemini-4-hydrogen-sonar must reach the catalog')
+  assert.equal(sonar.efforts, null, 'sonar has no effort ladder')
+  assert.equal(sonar.name, 'Gemini 4 Hydrogen (Sonar)')
+  assert.equal(lookupModelEnum(sonar.id), fixtureModels()['gemini-4-hydrogen-sonar']?.model)
+  for (const effort of ['minimal', 'low', 'medium', 'high', 'xhigh', 'off', undefined]) {
+    assert.equal(
+      getAntigravityRequestModelId('gemini-4-hydrogen-sonar', effort),
+      'gemini-4-hydrogen-sonar',
+      `sonar + ${String(effort)} must keep its own wire id`,
+    )
+  }
 
   const hydrogen = catalog.find((e) => e.id === 'gemini-4-hydrogen')
   assert.ok(hydrogen, 'gemini-4-hydrogen base entry must exist')

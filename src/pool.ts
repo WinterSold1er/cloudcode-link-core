@@ -44,12 +44,19 @@ const MODEL_EFFORT_SUFFIXES = [
 ] as const
 
 /**
- * Suffixes the backend uses to publish a model id it refuses to serve
- * (`gemini-4-hydrogen-disabled`, `gemini-4-hydrogen-sonar`). These are entitlement
- * declarations, never effort variants: a list holding only such entries does not make the base
- * model available.
+ * Suffixes the backend uses to publish a model id it explicitly refuses to serve
+ * (`gemini-4-hydrogen-disabled`, carried with `disabled: true` and an "Unavailable" tag in the
+ * captured FetchAvailableModels response). `disabled` is the server's own refusal marker.
+ *
+ * `sonar` is NOT such a marker, contrary to what this comment used to claim. In the same capture
+ * `gemini-4-hydrogen-sonar` is published with a live `quotaInfo` (remainingFraction ~1 plus a
+ * resetTime), no `disabled` / `beta` / `isInternal` flag and `recommended: true`, in no
+ * `agentModelSorts` / `tieredModelIds` group only because agy's picker does not show it — and live
+ * requests against it returned HTTP 200 with SSE text and `modelVersion: gemini-4-hydrogen-sonar`
+ * on three accounts (free-tier included). So it is a servable model of its own, and a list holding
+ * only `...-disabled` entries still says nothing about the base model.
  */
-const MODEL_UNSERVABLE_SUFFIXES = ['disabled', 'sonar'] as const
+const MODEL_UNSERVABLE_SUFFIXES = ['disabled'] as const
 
 /** Quarantine window for one (account, family, model base) triple after an upstream 403. */
 export const MODEL_UNSUPPORTED_COOLDOWN_MS = 5 * 60_000
@@ -67,7 +74,13 @@ export interface ModelEntitlement {
   readonly supported: boolean
 }
 
-/** `gemini-4-hydrogen-tiered-high` -> `gemini-4-hydrogen`; unservable markers are NOT stripped. */
+/**
+ * `gemini-4-hydrogen-tiered-high` -> `gemini-4-hydrogen`; unservable markers are NOT stripped.
+ * `gemini-4-hydrogen-sonar` keeps its full id on purpose: it has no effort ladder, so it is not a
+ * variant of `gemini-4-hydrogen`, and folding it in would make a sonar-only account look entitled
+ * to `gemini-4-hydrogen-medium` — a request the upstream answers with 403, which would quarantine
+ * the whole hydrogen family for that account.
+ */
 export function modelBaseOf(modelId: string): string {
   let base = modelId.trim().toLowerCase()
   for (;;) {
@@ -79,7 +92,7 @@ export function modelBaseOf(modelId: string): string {
   }
 }
 
-/** False for ids the backend marks as not serviceable (`...-disabled`, `...-sonar`). */
+/** False for ids the backend marks as not serviceable (`...-disabled`). */
 export function isServableModelId(modelId: string): boolean {
   const id = modelId.trim().toLowerCase()
   if (!id) return false
