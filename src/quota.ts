@@ -17,6 +17,7 @@ import {
 import type { AccountPoolManager } from './pool.ts'
 import { AGY_ENDPOINTS, OAUTH_USERINFO_URL, refreshTokens } from './oauth.ts'
 import { agyFetch } from './net.ts'
+import { AGY_CLI_VERSION, ensureProject, getProjectResolution, stableProjectId, type ProjectResolution } from './client.ts'
 
 export function mergeFallbackFamilyQuota(
   prev: FamilyQuotaInfo | undefined,
@@ -67,21 +68,205 @@ export function resolveClientPlatform(): { osType: string; arch: string } {
   return { osType, arch }
 }
 
-export function buildAgyCliUserAgent(version = '1.3.5'): string {
-  const { osType, arch } = resolveClientPlatform()
-  return `antigravity/cli/${version} (aidev_client; os_type=${osType}; arch=${arch}; cl=998863838; auth_method=consumer)`
+/**
+ * `cl=` changelist carried by agy 1.3.5 on the wire. The CLI converts a config string with
+ * strconv.Atoi before formatting it (ops/relink/t2-binary-findings.md #10), so the number is
+ * not a literal in the binary; the value below is the one observed byte-for-byte in the
+ * official traffic dump (ops/relink/t2-traffic-findings.md #2.2: `…081540Z-2.req.txt:5`,
+ * `…081812Z-35.req.txt:15`). `ANTIGRAVITY_CLI_CL` overrides it when a different agy build
+ * reports a different changelist.
+ */
+export const AGY_CLI_CHANGELIST = 998863838
+
+/** CLI version segment of the User-Agent: the shared AGY_CLI_VERSION from client.ts, with the
+ *  same `ANTIGRAVITY_CLI_VERSION` knob client.ts already honours, so quota and generation
+ *  cannot drift to two different identities. */
+export function agyCliVersion(): string {
+  return process.env.ANTIGRAVITY_CLI_VERSION?.trim() || AGY_CLI_VERSION
 }
 
-export const AGY_DISCOVERY_USER_AGENT = buildAgyCliUserAgent('1.3.5')
-export const AGY_QUOTA_USER_AGENT = 'antigravity/1.1.15 linux/amd64'
+function agyCliChangelist(): number {
+  const raw = process.env.ANTIGRAVITY_CLI_CL?.trim()
+  if (!raw) return AGY_CLI_CHANGELIST
+  const parsed = Number.parseInt(raw, 10)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : AGY_CLI_CHANGELIST
+}
 
-export function agyUserAgent(version = '1.3.5'): string {
+export function buildAgyCliUserAgent(version = AGY_CLI_VERSION): string {
+  const { osType, arch } = resolveClientPlatform()
+  return `antigravity/cli/${version} (aidev_client; os_type=${osType}; arch=${arch}; cl=${agyCliChangelist()}; auth_method=consumer)`
+}
+
+/**
+ * User-Agent for every codeassist RPC this service makes, including the two query RPCs
+ * (`v1internal:fetchAvailableModels`, `v1internal:retrieveUserQuotaSummary`).
+ *
+ * The traffic dump proves agy 1.3.5 uses one single identity for all of them: the quota
+ * summary request sends the same full CLI string as generation
+ * (ops/relink/t2-contract-diff.md #29: "UA 与生成同一个全串";
+ * ops/relink/t2-traffic-findings.md #2.2). The previously separate
+ * `antigravity/1.1.15 linux/amd64` quota identity has no evidence anywhere in the
+ * reverse-engineering artifacts and is gone.
+ * `ANTIGRAVITY_USER_AGENT` overrides the whole string for a different agy build.
+ */
+export function agyUserAgent(version = agyCliVersion()): string {
+  const override = process.env.ANTIGRAVITY_USER_AGENT?.trim()
+  if (override) return override
   return buildAgyCliUserAgent(version)
 }
 
-export function agyQuotaUserAgent(): string {
-  return AGY_QUOTA_USER_AGENT
+/**
+ * Body shared by the two project-scoped query RPCs.
+ *
+ * agy 1.3.5 sends exactly one field on both:
+ *   - `v1internal:retrieveUserQuotaSummary`: 30-byte body `{"project":"aicode-consumers"}`
+ *     (ops/relink/t2-contract-diff.md #29, capture `…080901Z-9.req.txt`).
+ *   - `v1internal:fetchAvailableModels`: `{"project":"…"}`
+ *     (ops/relink/t2-traffic-findings.md #2.3, capture `…080901Z-3.req.txt:23`).
+ *
+ * `FetchAvailableModelsRequest` also declares request_id(2), location(3) and entitlement(9),
+ * but the CLI leaves them unset and protojson drops unset/zero fields, so they never reach
+ * the wire; `entitlement` has no settable sub-field (`tier` / `tierId` are rejected with
+ * HTTP 400 `Unknown name`). Sending `{}` — the previous behaviour — omitted the only field the
+ * backend is documented to read here. Whether that gap contributed to the 2026-10 quota outage
+ * is NOT established: docs/root-cause/root-cause-report.md attributes that outage to the
+ * `Gemini Models` group disappearing on the daily endpoint plus the mergeFallbackFamilyQuota
+ * freeze, not to the body.
+ */
+export interface AgyProjectScopedRequestBody {
+  project: string
 }
+
+export function agyProjectScopedRequest(project: string): AgyProjectScopedRequestBody {
+  const trimmed = project.trim()
+  if (!trimmed) {
+    throw new Error('agy project-scoped request requires a non-empty project id')
+  }
+  return { project: trimmed }
+}
+
+/**
+ * What a project lookup for the two query RPCs actually produced.
+ *
+ * Only two sources have evidence of being accepted upstream, and both are real values handed
+ * to us rather than invented here:
+ *   - `cloudaicompanionProject` in the loadCodeAssist response — `aicode-consumers`, which is
+ *     then reused verbatim as `project` on all six captured endpoints
+ *     (ops/relink/t2-traffic-findings.md #2.4 / #2.6 / #3).
+ *   - an explicit `ANTIGRAVITY_PROJECT_ID` set by the operator.
+ *
+ * `stableProjectId(seed)` — the sha1-shaped id `ensureProject` ends in — appears in no capture.
+ * The two candidate values have different evidence, and the earlier version of this comment
+ * attributed them to the wrong place: `aicode-consumers` comes from the live `loadCodeAssist`
+ * response (the captured 200 body), *not* from the binary — measured on 2026-11-18,
+ * `grep -a -c aicode-consumers /usr/bin/agy` is 0. `default-cli-project` is the string agy itself
+ * carries and is the only one of the two present in the binary (`grep -a -c` = 1). An unresolved
+ * lookup therefore has nothing to send:
+ * the RPC is skipped and `projectUnresolved` records why, instead of putting a plausible-looking
+ * id on the wire and letting it come back as a 400/403 that hides the real fault.
+ */
+export type AgyProjectResolution =
+  | {
+      projectUnresolved: false
+      project: string
+      source: 'loadCodeAssist' | 'explicit-override'
+      reason: string
+    }
+  | {
+      projectUnresolved: true
+      project: undefined
+      source: 'unresolved'
+      reason: string
+    }
+
+/**
+ * The operator-set project: the same variable `defaultProjectId` consults (client.ts:254).
+ * It is the only non-loadCodeAssist id with an explicit source, so it stays honoured.
+ */
+function explicitProjectOverride(): string | undefined {
+  return process.env.ANTIGRAVITY_PROJECT_ID?.trim() || undefined
+}
+
+/**
+ * Decide whether the id `ensureProject` handed back is a project the backend actually offered
+ * or this repo's own deterministic invention.
+ *
+ * `ensureProject` never throws and never returns empty: when loadCodeAssist and onboardUser both
+ * fail to name a project it returns `defaultProjectId(seedOrEmail)`, whose non-env branch is
+ * `stableProjectId(seed)`. So the unresolved case is not detectable by emptiness. Two independent
+ * layers detect it:
+ *   - `lookup.synthesized` — the flag client.ts recorded during the lookup itself
+ *     (`getProjectResolution(token, seed)`). Authoritative even when the cached id's shape does
+ *     not match this call's seed, which is what an id cached under a different seed, or an
+ *     override set after the lookup, looks like.
+ *   - the exact derivation `stableProjectId(seed)` — the backstop that still holds when the
+ *     cache entry is gone (expired or evicted), so a derived id can never reach the wire just
+ *     because the flag was unreadable.
+ *
+ * Precedence matches client.ts: a project the backend named wins over the env override; the
+ * override only stands in when nothing was named.
+ */
+function classifyProjectResolution(
+  resolved: string,
+  seed: string,
+  lookup?: ProjectResolution,
+): AgyProjectResolution {
+  const project = resolved.trim()
+  const explicit = explicitProjectOverride()
+  if (!project) {
+    return {
+      projectUnresolved: true,
+      project: undefined,
+      source: 'unresolved',
+      reason: `project lookup for seed "${seed}" returned no project id`,
+    }
+  }
+  if (explicit && project === explicit) {
+    return {
+      projectUnresolved: false,
+      project,
+      source: 'explicit-override',
+      reason: `ANTIGRAVITY_PROJECT_ID override set by the operator (${project})`,
+    }
+  }
+  if (lookup?.synthesized || project === stableProjectId(seed)) {
+    return {
+      projectUnresolved: true,
+      project: undefined,
+      source: 'unresolved',
+      reason:
+        `loadCodeAssist/onboardUser named no project for seed "${seed}" ` +
+        (lookup?.synthesized
+          ? `and client.ts cached ${project} as a synthesized fallback`
+          : `and ${project} is this repo's own sha1-derived id`) +
+        ' — no captured upstream request ever carried one',
+    }
+  }
+  return {
+    projectUnresolved: false,
+    project,
+    source: 'loadCodeAssist',
+    reason: `project ${project} was named by loadCodeAssist/onboardUser`,
+  }
+}
+
+/**
+ * Per-call context for the two query RPCs.
+ * `accountKey` scopes endpoint memory and the recorded project resolution to one account,
+ * `projectSeed` is the seed handed to `ensureProject` for the lookup — the same seed adapter.ts
+ * and oneshot.ts use for generation, so quota and generation look the project up under one
+ * identity — `endpoints` overrides the endpoint list (ops/tests pointing at one host).
+ * The seed is never a project id: only what the lookup names goes on the wire.
+ */
+export interface QuotaRequestContext {
+  accountKey?: string
+  projectSeed?: string
+  endpoints?: readonly string[]
+}
+
+/** Seed used to look a project up when a call has no account identity to seed the lookup with. */
+export const AGY_PROJECT_FALLBACK_SEED = 'antigravity-default'
+
 
 export interface StoredToken {
   accessToken?: string
@@ -278,11 +463,35 @@ export function readMacKeychainToken(): StoredToken | null {
 }
 
 export class QuotaService {
-  private preferredEndpointIndex = 0
+  /**
+   * Endpoint memory per account (account id -> the endpoint that last answered 200).
+   *
+   * This used to be a single `preferredEndpointIndex` on the service: one account succeeding
+   * on `daily-cloudcode-pa` pinned that endpoint for *every* account, even accounts behind a
+   * different proxy or a different tier that only get answered elsewhere. Endpoint choice is
+   * a property of the account's path to Google, not of the service, so it is keyed by account
+   * now. Calls with no account identity neither read nor write it.
+   */
+  private readonly preferredEndpointByAccount = new Map<string, string>()
+  /** In-flight project resolutions keyed by token+seed, so a quota+models pair fired in the
+   *  same refresh does not issue two loadCodeAssist calls for one account. client.ts's project
+   *  cache uses the same identity (`getProjectResolution`), so a fallback synthesized for one
+   *  seed is never served to a different seed that shares the access token. */
+  private readonly projectResolutions = new Map<string, Promise<AgyProjectResolution>>()
+  /** Last resolution per account, so an account whose call was skipped names the reason in its
+   *  own result (discoverAvailableModels account failures) instead of being filed as an
+   *  endpoint failure. */
+  private readonly projectResolutionByAccount = new Map<string, AgyProjectResolution>()
+
   private readonly pool: AccountPoolManager
   private readonly refreshLocks = new Map<string, Promise<string | null>>()
   public lastEndpointErrors: string[] = []
   public lastQuotaEndpointErrors: string[] = []
+  /** Project resolution behind the last fetchQuotaSummary / fetchAvailableModels call.
+   *  `projectUnresolved: true` means the lookup named no upstream-accepted project and the RPC
+   *  was skipped: no request was sent, and the reason is in the matching endpoint-error list. */
+  public lastQuotaProjectResolution?: AgyProjectResolution
+  public lastModelsProjectResolution?: AgyProjectResolution
   public lastDiscoveryDiagnostics?: {
     at: number
     succeeded: number
@@ -440,32 +649,144 @@ export class QuotaService {
     return null
   }
 
-  private getOrderedEndpoints(): string[] {
-    const total = AGY_ENDPOINTS.length
-    const ordered: string[] = []
-    for (let i = 0; i < total; i++) {
-      ordered.push(AGY_ENDPOINTS[(this.preferredEndpointIndex + i) % total]!)
-    }
-    return ordered
+  private getOrderedEndpoints(accountKey?: string, overrides?: readonly string[]): string[] {
+    const base = overrides && overrides.length > 0 ? [...overrides] : [...AGY_ENDPOINTS]
+    const remembered = accountKey ? this.preferredEndpointByAccount.get(accountKey) : undefined
+    if (!remembered) return base
+    const at = base.indexOf(remembered)
+    if (at <= 0) return base
+    return [remembered, ...base.slice(0, at), ...base.slice(at + 1)]
   }
 
-  async fetchQuotaSummary(accessToken: string, proxyUrl?: string): Promise<QuotaSummaryResponse | null> {
-    const endpoints = this.getOrderedEndpoints()
+  /** Remember which endpoint answered this account, so the next call starts there. */
+  private rememberEndpoint(accountKey: string | undefined, endpoint: string): void {
+    if (accountKey) this.preferredEndpointByAccount.set(accountKey, endpoint)
+  }
+
+  /**
+   * Query context for one pooled account: the id scopes its endpoint memory and its recorded
+   * project resolution, and the seed is exactly what adapter.ts / oneshot.ts hand to
+   * `ensureProject` for generation, so quota and generation look the project up under one
+   * identity and one loadCodeAssist answer serves both.
+   */
+  private requestContextFor(account: ManagedAccount): QuotaRequestContext {
+    return { accountKey: account.id, projectSeed: account.alias || account.id }
+  }
+
+  /**
+   * Resolve the `project` the two query RPCs must carry.
+   *
+   * `ensureProject` is the loadCodeAssist -> onboardUser -> fallback chain client.ts already
+   * uses for generation, and loadCodeAssist is exactly how agy itself learns the id it puts in
+   * these bodies (the captured response carries `cloudaicompanionProject:"aicode-consumers"`,
+   * ops/relink/t2-traffic-findings.md #2.4, and that value reappears verbatim as `project` on
+   * every captured request). The endpoints handed to it are the same ordered list the RPC loop
+   * will walk, so a quota refresh never reaches a host the caller did not already approve.
+   *
+   * The chain's last resort is `defaultProjectId(seed)`, a sha1-shaped id this repo invented.
+   * It is classified here instead of being sent: nothing in the capture or in the binary's
+   * strings shows such an id being accepted, so an unresolved lookup is reported as unresolved
+   * and the caller skips the RPC.
+   */
+  private async resolveRequestProject(
+    accessToken: string,
+    proxyUrl: string | undefined,
+    context: QuotaRequestContext,
+  ): Promise<AgyProjectResolution> {
+    const seed = context.projectSeed?.trim() || AGY_PROJECT_FALLBACK_SEED
+    const key = `${accessToken}\u0000${seed}`
+    const running = this.projectResolutions.get(key)
+    if (running) return running
+    const endpoints = this.getOrderedEndpoints(context.accountKey, context.endpoints)
+    const resolution = ensureProject(accessToken, seed, proxyUrl, endpoints)
+      .then((project) =>
+        classifyProjectResolution(project, seed, getProjectResolution(accessToken, seed)),
+      )
+      .finally(() => {
+        this.projectResolutions.delete(key)
+      })
+    this.projectResolutions.set(key, resolution)
+    return resolution
+  }
+
+
+  /**
+   * Headers for the two project-scoped query RPCs.
+   * The captured agy header union over all 67 codeassist flows is 10 entries wide and contains
+   * none of `x-goog-api-client`, `x-goog-user-project`, `client-metadata`, `Accept` or
+   * `x-goog-api-key` (ops/relink/t2-traffic-findings.md #2.2: those are listed as "不存在的头"),
+   * so these requests deliberately send nothing beyond bearer + content type + CLI identity.
+   * `Accept-Encoding`/`Content-Length` are added by the transport, not here.
+   */
+  private queryRequestHeaders(accessToken: string): Record<string, string> {
+    return {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+      'User-Agent': agyUserAgent(),
+    }
+  }
+
+  /**
+   * Resolve the project for one query RPC and record what the resolution produced.
+   *
+   * An unresolved outcome is pushed into `errors` — the same array each RPC loop publishes as
+   * `lastQuotaEndpointErrors` / `lastEndpointErrors` — so the caller can skip the upstream call
+   * with the reason already on the observability surface. A resolution that throws is filed the
+   * same way; nothing is swallowed and no derived id reaches the wire.
+   */
+  private async resolveProjectForQuery(
+    accessToken: string,
+    proxyUrl: string | undefined,
+    context: QuotaRequestContext,
+    errors: string[],
+  ): Promise<AgyProjectResolution> {
+    let resolution: AgyProjectResolution
+    try {
+      resolution = await this.resolveRequestProject(accessToken, proxyUrl, context)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      resolution = {
+        projectUnresolved: true,
+        project: undefined,
+        source: 'unresolved',
+        reason: `project resolution threw: ${message}`,
+      }
+    }
+    if (context.accountKey) this.projectResolutionByAccount.set(context.accountKey, resolution)
+    if (resolution.projectUnresolved) errors.push(`project unresolved: ${resolution.reason}`)
+    return resolution
+  }
+
+  /**
+   * `null` means "no summary", and the two ways that happens stay distinguishable: a project
+   * this installation cannot name sends nothing and is recorded in `lastQuotaProjectResolution`
+   * plus `lastQuotaEndpointErrors`; an endpoint that refused an accepted project is recorded in
+   * `lastQuotaEndpointErrors` alone.
+   */
+  async fetchQuotaSummary(
+    accessToken: string,
+    proxyUrl?: string,
+    context: QuotaRequestContext = {},
+  ): Promise<QuotaSummaryResponse | null> {
+    const endpoints = this.getOrderedEndpoints(context.accountKey, context.endpoints)
     const endpointErrors: string[] = []
+    const resolution = await this.resolveProjectForQuery(accessToken, proxyUrl, context, endpointErrors)
+    this.lastQuotaProjectResolution = resolution
+    if (resolution.projectUnresolved) {
+      this.lastQuotaEndpointErrors = endpointErrors
+      return null
+    }
+    const body = JSON.stringify(agyProjectScopedRequest(resolution.project))
     for (let i = 0; i < endpoints.length; i++) {
       const endpoint = endpoints[i]!
       try {
         const res = await agyFetch(`${endpoint}/v1internal:retrieveUserQuotaSummary`, {
           method: 'POST',
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            'Content-Type': 'application/json',
-            'User-Agent': agyQuotaUserAgent(),
-          },
-          body: JSON.stringify({}),
+          headers: this.queryRequestHeaders(accessToken),
+          body,
         }, proxyUrl)
         if (res.ok) {
-          this.preferredEndpointIndex = AGY_ENDPOINTS.indexOf(endpoint)
+          this.rememberEndpoint(context.accountKey, endpoint)
           this.lastQuotaEndpointErrors = endpointErrors
           return (await res.json()) as QuotaSummaryResponse
         }
@@ -481,23 +802,35 @@ export class QuotaService {
     return null
   }
 
-  async fetchAvailableModels(accessToken: string, proxyUrl?: string): Promise<DiscoveredModelsResponse | null> {
-    const endpoints = this.getOrderedEndpoints()
+  /**
+   * `null` means "no model payload", with the cause recorded: `lastModelsProjectResolution`
+   * says whether an upstream-accepted project existed at all (skipped, zero requests sent) and
+   * `lastEndpointErrors` says which hosts refused one that did.
+   */
+  async fetchAvailableModels(
+    accessToken: string,
+    proxyUrl?: string,
+    context: QuotaRequestContext = {},
+  ): Promise<DiscoveredModelsResponse | null> {
+    const endpoints = this.getOrderedEndpoints(context.accountKey, context.endpoints)
     const endpointErrors: string[] = []
+    const resolution = await this.resolveProjectForQuery(accessToken, proxyUrl, context, endpointErrors)
+    this.lastModelsProjectResolution = resolution
+    if (resolution.projectUnresolved) {
+      this.lastEndpointErrors = endpointErrors
+      return null
+    }
+    const body = JSON.stringify(agyProjectScopedRequest(resolution.project))
     for (let i = 0; i < endpoints.length; i++) {
       const endpoint = endpoints[i]!
       try {
         const res = await agyFetch(`${endpoint}/v1internal:fetchAvailableModels`, {
           method: 'POST',
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            'Content-Type': 'application/json',
-            'User-Agent': agyUserAgent(),
-          },
-          body: JSON.stringify({}),
+          headers: this.queryRequestHeaders(accessToken),
+          body,
         }, proxyUrl)
         if (res.ok) {
-          this.preferredEndpointIndex = AGY_ENDPOINTS.indexOf(endpoint)
+          this.rememberEndpoint(context.accountKey, endpoint)
           this.lastEndpointErrors = endpointErrors
           return (await res.json()) as DiscoveredModelsResponse
         }
@@ -566,8 +899,16 @@ export class QuotaService {
       const accessToken = await this.getValidAccessToken(acc)
       if (!accessToken) return { res: null, error: 'Failed to acquire valid access token' }
       try {
-        const res = await this.fetchAvailableModels(accessToken, acc.proxyUrl)
-        if (!res) return { res: null, error: 'fetchAvailableModels returned null from all endpoints' }
+        const res = await this.fetchAvailableModels(accessToken, acc.proxyUrl, this.requestContextFor(acc))
+        if (!res) {
+          // An account whose project could not be resolved never reached an endpoint; filing it
+          // as an endpoint failure would point the next reader at the wrong layer.
+          const resolution = this.projectResolutionByAccount.get(acc.id)
+          if (resolution?.projectUnresolved) {
+            return { res: null, error: `project unresolved: ${resolution.reason}` }
+          }
+          return { res: null, error: 'fetchAvailableModels returned null from all endpoints' }
+        }
         return { res }
       } catch (err) {
         return { res: null, error: err instanceof Error ? err.message : String(err) }
@@ -683,23 +1024,25 @@ export class QuotaService {
       this.pool.resetAccountIdentity(account.id, email)
     }
 
+    const queryContext = this.requestContextFor(account)
+
     let summary: QuotaSummaryResponse | null = null
     let discovered: DiscoveredModelsResponse | null = null
 
     if (options?.summaryOnly) {
-      summary = await this.fetchQuotaSummary(accessToken, account.proxyUrl)
+      summary = await this.fetchQuotaSummary(accessToken, account.proxyUrl, queryContext)
       const hasGoogleInSummary = summary?.groups?.some((g) => {
         const dName = (g.displayName || '').toLowerCase()
         const desc = (g.description || '').toLowerCase()
         return dName.includes('gemini') || desc.includes('gemini')
       })
       if (!hasGoogleInSummary) {
-        discovered = await this.fetchAvailableModels(accessToken, account.proxyUrl)
+        discovered = await this.fetchAvailableModels(accessToken, account.proxyUrl, queryContext)
       }
     } else {
       const [sum, disc] = await Promise.all([
-        this.fetchQuotaSummary(accessToken, account.proxyUrl),
-        this.fetchAvailableModels(accessToken, account.proxyUrl),
+        this.fetchQuotaSummary(accessToken, account.proxyUrl, queryContext),
+        this.fetchAvailableModels(accessToken, account.proxyUrl, queryContext),
       ])
       summary = sum
       discovered = disc

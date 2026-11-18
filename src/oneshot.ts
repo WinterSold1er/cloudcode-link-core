@@ -111,7 +111,9 @@ export async function runAgyOnce(
     }
 
     const family = modelFamilyOf(wireModel)
-    const account = deps.pool?.selectAccount(family)
+    // Ask for an account entitled to THIS wire model: without the model argument the pool hands
+    // the request to an account that cannot serve it and the turn ends in a needless 403.
+    const account = deps.pool?.selectAccount(family, wireModel)
     const accountId = account?.id || 'acc_default'
 
     let token: string | null = null
@@ -124,6 +126,22 @@ export async function runAgyOnce(
     }
 
     if (!token) {
+      // Two different faults land here, and the pool can tell them apart. When every account is
+      // signed in but each one's model list excludes this wire model, the verdict is
+      // `model_not_available`: re-authenticating fixes nothing, and no request was ever sent, so
+      // reporting it as an auth failure points the user at a sign-in they do not need.
+      const status = deps.pool?.getFamilyStatus(family, wireModel)
+      if (status?.suppressed && status.reason === 'model_not_available') {
+        return {
+          ok: false,
+          text: '',
+          conversationId: null,
+          error:
+            `No signed-in Antigravity account serves ${wireModel}: every account's model list ` +
+            `excludes it, and no request was sent. Choose a model your accounts actually serve.`,
+          durationMs: Date.now() - startTime,
+        }
+      }
       return {
         ok: false,
         text: '',
@@ -145,7 +163,7 @@ export async function runAgyOnce(
 
     const requestBody: AntigravityGenerateRequest = {
       project: projectId,
-      model: wireModel,
+      requestId: envelope.requestId,
       request: {
         contents: [
           {
@@ -160,9 +178,9 @@ export async function runAgyOnce(
         sessionId: envelope.sessionId,
         labels: envelope.labels,
       },
-      requestType: 'AGENT',
-      userAgent: 'ANTIGRAVITY',
-      requestId: envelope.requestId,
+      model: wireModel,
+      userAgent: envelope.userAgent,
+      requestType: envelope.requestType,
     }
 
     const streamResult = await streamGenerateContent(

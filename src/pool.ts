@@ -22,6 +22,103 @@ export function defaultPoolDir(customBase?: string): string {
   return join(homedir(), '.cloudcode', 'accounts')
 }
 
+/**
+ * Effort / routing modifiers the backend appends to a wire model id
+ * (`gemini-4-hydrogen-high`, `gemini-4-hydrogen-tiered-high`, `gemini-2.5-flash-thinking`).
+ * They are stripped from the tail so a requested wire id can be compared with the model ids an
+ * account is actually entitled to: an account that serves `gemini-4-hydrogen-medium` can serve a
+ * `gemini-4-hydrogen-high` request even when that exact effort string is absent from its list.
+ * Longer modifiers come first so `-xhigh` is never half-stripped as `-high`.
+ */
+const MODEL_EFFORT_SUFFIXES = [
+  'xhigh',
+  'high',
+  'medium',
+  'low',
+  'minimal',
+  'none',
+  'off',
+  'auto',
+  'thinking',
+  'tiered',
+] as const
+
+/**
+ * Suffixes the backend uses to publish a model id it refuses to serve
+ * (`gemini-4-hydrogen-disabled`, `gemini-4-hydrogen-sonar`). These are entitlement
+ * declarations, never effort variants: a list holding only such entries does not make the base
+ * model available.
+ */
+const MODEL_UNSERVABLE_SUFFIXES = ['disabled', 'sonar'] as const
+
+/** Quarantine window for one (account, family, model base) triple after an upstream 403. */
+export const MODEL_UNSUPPORTED_COOLDOWN_MS = 5 * 60_000
+
+/** Repeated 403s for the same model escalate the quarantine, but never past this bound. */
+export const MODEL_UNSUPPORTED_MAX_COOLDOWN_MS = 30 * 60_000
+
+/** Verdict of "can this account serve this wire model?" for one family. */
+export interface ModelEntitlement {
+  /** Effort-stripped base of the requested wire model. */
+  readonly base: string
+  /** False when the account has never published a model list for this family. */
+  readonly known: boolean
+  /** True when serving the requested wire model is plausible for this account. */
+  readonly supported: boolean
+}
+
+/** `gemini-4-hydrogen-tiered-high` -> `gemini-4-hydrogen`; unservable markers are NOT stripped. */
+export function modelBaseOf(modelId: string): string {
+  let base = modelId.trim().toLowerCase()
+  for (;;) {
+    const modifier = MODEL_EFFORT_SUFFIXES.find(
+      (suffix) => base.endsWith(`-${suffix}`) && base.length > suffix.length + 1,
+    )
+    if (!modifier) return base
+    base = base.slice(0, -(modifier.length + 1))
+  }
+}
+
+/** False for ids the backend marks as not serviceable (`...-disabled`, `...-sonar`). */
+export function isServableModelId(modelId: string): boolean {
+  const id = modelId.trim().toLowerCase()
+  if (!id) return false
+  return !MODEL_UNSERVABLE_SUFFIXES.some((marker) => id === marker || id.endsWith(`-${marker}`))
+}
+
+/**
+ * Model-level entitlement of one account.
+ *
+ * An account whose family quota carries no `models[]` list (never refreshed, or the backend did
+ * not send the breakdown) is treated as ENTITLED: missing data must not disqualify the whole pool.
+ */
+export function modelEntitlementOf(
+  account: ManagedAccount,
+  family: ModelFamily,
+  wireModel: string,
+): ModelEntitlement {
+  const requested = wireModel.trim().toLowerCase()
+  const base = modelBaseOf(requested)
+  const listing = account.quotas[family]?.models
+  if (!Array.isArray(listing) || listing.length === 0) {
+    return { base, known: false, supported: true }
+  }
+  if (!isServableModelId(requested)) {
+    return { base, known: true, supported: false }
+  }
+  const supported = listing.some((entry) => {
+    const listed = typeof entry.modelId === 'string' ? entry.modelId.trim().toLowerCase() : ''
+    if (!listed || !isServableModelId(listed)) return false
+    return listed === requested || modelBaseOf(listed) === base
+  })
+  return { base, known: true, supported }
+}
+
+/** Key of the model quarantine map: one account, one family, one effort-stripped model base. */
+function modelQuarantineKey(id: string, family: ModelFamily, wireModel: string): string {
+  return `${id}|${family}|${modelBaseOf(wireModel)}`
+}
+
 export class Semaphore {
   private active = 0
   private queue: Array<() => void> = []
@@ -56,6 +153,13 @@ export class AccountPoolManager {
   private readonly activeMemoryTokens = new Map<string, { token: string; expiresAt: number }>()
   private readonly accountSemaphores = new Map<string, Semaphore>()
   private readonly runtimeActiveAccountIds = new Map<ModelFamily, string>()
+  /**
+   * Model-scoped soft failures: `id|family|modelBase` -> quarantine state. Populated when the
+   * backend answers 403 for a model an account is not entitled to. Runtime-only on purpose —
+   * entitlement is re-probed from `quotas[family].models` after a quota refresh, and a stale
+   * "this account cannot do X" verdict must never outlive the process that observed it.
+   */
+  private readonly modelQuarantine = new Map<string, { cooldownUntil: number; reason: string; consecutiveFailures: number }>()
   private writeQueue: Promise<void> = Promise.resolve()
   private lowQuotaThreshold = 0.05
 
@@ -618,6 +722,59 @@ export class AccountPoolManager {
     this.persist()
   }
 
+  /**
+   * Soft-fail an account for ONE model only (upstream 403 / "no such model for this user").
+   *
+   * This is deliberately NOT `markAuthRequired`: a 403 says "this credential may be fine, but not
+   * for this model". Quarantining the whole account turns a model mismatch into a pool-wide
+   * "sign in again" error, which is what made the pool report
+   * `No authenticated Antigravity account available` while every account was actually signed in.
+   * Repeated refusals for the same model escalate the quarantine within
+   * {@link MODEL_UNSUPPORTED_MAX_COOLDOWN_MS}.
+   */
+  recordModelUnsupported(id: string, family: ModelFamily, wireModel: string, reason?: string): void {
+    const acc = this.getAccount(id)
+    if (!acc) return
+    const key = modelQuarantineKey(id, family, wireModel)
+    const prev = this.modelQuarantine.get(key)
+    const consecutiveFailures = (prev?.consecutiveFailures ?? 0) + 1
+    const cooldownMs = Math.min(
+      MODEL_UNSUPPORTED_COOLDOWN_MS * consecutiveFailures,
+      MODEL_UNSUPPORTED_MAX_COOLDOWN_MS,
+    )
+    this.modelQuarantine.set(key, {
+      cooldownUntil: Date.now() + cooldownMs,
+      reason: reason || `Model '${wireModel}' refused by this account`,
+      consecutiveFailures,
+    })
+  }
+
+  /** Current model quarantine for an account, or null when none applies (expired entries cleared). */
+  getModelQuarantine(id: string, family: ModelFamily, wireModel: string): {
+    cooldownUntil: number
+    reason: string
+    consecutiveFailures: number
+  } | null {
+    const key = modelQuarantineKey(id, family, wireModel)
+    const entry = this.modelQuarantine.get(key)
+    if (!entry) return null
+    if (entry.cooldownUntil <= Date.now()) {
+      this.modelQuarantine.delete(key)
+      return null
+    }
+    return entry
+  }
+
+  /** Drop model quarantines (all accounts / one account / one family). Used by `/ccl` remediation. */
+  clearModelQuarantine(id?: string, family?: ModelFamily): void {
+    for (const key of [...this.modelQuarantine.keys()]) {
+      const [accId, accFamily] = key.split('|')
+      if (id && accId !== id) continue
+      if (family && accFamily !== family) continue
+      this.modelQuarantine.delete(key)
+    }
+  }
+
   recordSuccess(id: string, family: ModelFamily): void {
     const acc = this.getAccount(id)
     if (!acc) return
@@ -647,7 +804,25 @@ export class AccountPoolManager {
     this.persist()
   }
 
-  isAccountHealthy(account: ManagedAccount, family: ModelFamily, threshold = this.lowQuotaThreshold): boolean {
+  /**
+   * Health check for scheduling.
+   *
+   * Overloads keep every existing caller working: the third argument is the wire model when it is
+   * a string (`isAccountHealthy(acc, 'google', 'gemini-4-hydrogen-high')`) and the low-quota
+   * threshold when it is a number. Passing no third argument behaves exactly as before.
+   */
+  isAccountHealthy(account: ManagedAccount, family: ModelFamily, wireModel?: string): boolean
+  isAccountHealthy(account: ManagedAccount, family: ModelFamily, threshold: number, wireModel?: string): boolean
+  isAccountHealthy(
+    account: ManagedAccount,
+    family: ModelFamily,
+    thresholdOrWireModel?: number | string,
+    maybeWireModel?: string,
+  ): boolean {
+    const threshold =
+      typeof thresholdOrWireModel === 'number' ? thresholdOrWireModel : this.lowQuotaThreshold
+    const wireModel =
+      typeof thresholdOrWireModel === 'string' ? thresholdOrWireModel : maybeWireModel
     if (!account.enabled || account.authRequired) return false
     const now = Date.now()
     const cd = account.cooldowns[family]
@@ -665,11 +840,24 @@ export class AccountPoolManager {
         if (!Number.isNaN(resetMs) && resetMs > now) return false
       }
     }
+    if (wireModel?.trim()) {
+      // Model-level entitlement: the account's own quota snapshot lists the ids it can serve.
+      if (!modelEntitlementOf(account, family, wireModel).supported) return false
+      // Soft 403 quarantine recorded earlier for this exact model base.
+      if (this.getModelQuarantine(account.id, family, wireModel)) return false
+    }
     return true
   }
 
-  selectAccount(family: ModelFamily): ManagedAccount | null {
-    const candidates = this.data.accounts.filter((acc) => this.isAccountHealthy(acc, family))
+  /**
+   * Pick a schedulable account. When `wireModel` is given, entitlement filtering happens HERE so
+   * every strategy below (pin, round-robin, sticky drain) only ever sees accounts that can serve
+   * the requested model. Without `wireModel` the behaviour is unchanged.
+   */
+  selectAccount(family: ModelFamily, wireModel?: string): ManagedAccount | null {
+    const candidates = this.data.accounts.filter((acc) =>
+      this.isAccountHealthy(acc, family, wireModel),
+    )
 
     if (candidates.length === 0) return null
 
@@ -771,7 +959,13 @@ export class AccountPoolManager {
     return earliest !== null ? Math.max(0, earliest - now) : null
   }
 
-  getFamilyStatus(family: ModelFamily): FamilyStatus {
+  /**
+   * Pool verdict for one family. With `wireModel` the verdict is model-aware: when every signed-in
+   * account publishes a model list that excludes the requested model, the reason is
+   * `model_not_available` — NOT `auth_required`, which would send the user to `/ccl auth` for a
+   * problem re-authenticating cannot fix.
+   */
+  getFamilyStatus(family: ModelFamily, wireModel?: string): FamilyStatus {
     const accounts = this.data.accounts
     if (accounts.length === 0) {
       return { hasAccount: false, suppressed: false, reason: 'no_accounts', resetInMs: null }
@@ -787,9 +981,20 @@ export class AccountPoolManager {
       return { hasAccount: false, suppressed: false, reason: 'auth_required', resetInMs: null }
     }
 
-    const candidate = this.selectAccount(family)
+    const candidate = this.selectAccount(family, wireModel)
     if (candidate) {
       return { hasAccount: true, suppressed: false, resetInMs: null }
+    }
+
+    if (wireModel?.trim()) {
+      // Entitlement blocks scheduling only when every signed-in account is KNOWN not to serve the
+      // model. Accounts whose model list was never refreshed stay "unknown = allowed".
+      const allKnownUnsupported = authValidAccounts.every(
+        (a) => !modelEntitlementOf(a, family, wireModel).supported,
+      )
+      if (allKnownUnsupported) {
+        return { hasAccount: true, suppressed: true, reason: 'model_not_available', resetInMs: null }
+      }
     }
 
     const resetInMs = this.getEarliestResetCountdown(family)

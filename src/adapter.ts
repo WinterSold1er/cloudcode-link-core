@@ -310,7 +310,7 @@ export class AgyAdapter {
 
           const requestBody: AntigravityGenerateRequest = {
             project: projectId,
-            model: wireModel,
+            requestId: envelope.requestId,
             request: {
               contents,
               ...(projection.systemInstruction
@@ -326,9 +326,9 @@ export class AgyAdapter {
               sessionId: envelope.sessionId,
               labels: envelope.labels,
             },
-            requestType: 'AGENT',
-            userAgent: 'ANTIGRAVITY',
-            requestId: envelope.requestId,
+            model: wireModel,
+            userAgent: envelope.userAgent,
+            requestType: envelope.requestType,
           }
 
           // 5. Connect and stream
