@@ -151,6 +151,34 @@ export interface DiscoveredModelEntry {
   modelName?: string
   disabled?: boolean
   enabled?: boolean
+  /**
+   * Set by `QuotaService` on entries that come from an account's last-known model list
+   * (pool.json `accounts[].quotas[fam].models`, or a model payload that account answered
+   * with earlier). It marks the id as "some still-usable account was last seen serving
+   * this", which is what keeps an account's exclusive models in the catalog when that
+   * account's own probe times out this round.
+   */
+  accountListed?: true
+}
+
+/** One account's contribution to the composed catalog union. */
+export interface ModelUnionAccount {
+  accountId: string
+  /** Number of model ids this account contributed. */
+  models: number
+  /** 'probed' = answered during the discovery round that produced this snapshot. */
+  origin: 'probed' | 'last-known'
+}
+
+/**
+ * Cross-account model union: the cheap, network-free synthesis the catalog is built from.
+ * `models` is keyed by model id, `providers` maps a model id to the account ids whose
+ * last-known list contains it.
+ */
+export interface ModelUnionSnapshot {
+  models: Record<string, DiscoveredModelEntry>
+  providers: Record<string, string[]>
+  accounts: ModelUnionAccount[]
 }
 
 export interface DiscoveredModelsResponse {
@@ -170,5 +198,21 @@ export interface DiscoveredModelsResponse {
   discoveredSkippedOverBudget?: number
   accountFailures?: Array<{ accountId: string; error: string }>
   endpointErrors?: string[]
+  /**
+   * Accounts that made up the returned `models` union, including the ones whose probe failed
+   * this round and contributed their last-known list instead. Set by `discoverAvailableModels`
+   * and `composeAvailableModels`.
+   */
+  catalogAccounts?: ModelUnionAccount[]
+  /** How many accounts contributed to `models` (`catalogAccounts.length`). */
+  unionAccounts?: number
+  /** model id -> ids of the accounts whose last-known model list contains it. */
+  modelProviders?: Record<string, string[]>
+  /**
+   * Accounts whose probe answered but carried no model list at all: their roster was kept
+   * unchanged rather than wiped. Kept separate from `accountFailures` so a payload-shape
+   * problem is never counted as an upstream failure.
+   */
+  rosterKeptAccounts?: string[]
 }
 

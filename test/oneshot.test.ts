@@ -22,6 +22,6 @@ describe('Oneshot & File Inlining', () => {
       },
     )
     assert.equal(res.ok, false)
-    assert.ok(res.error?.includes('No authenticated Antigravity account available.'))
+    assert.ok(res.error?.includes('No authenticated CloudCode Link account available.'))
   })
 })

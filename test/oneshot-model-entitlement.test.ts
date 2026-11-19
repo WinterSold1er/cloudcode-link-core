@@ -199,7 +199,7 @@ describe('Oneshot account selection is model-aware (packages/core/src/oneshot.ts
       assert.ok(error.includes(wireModel), `the message must name the model that cannot be served, got: ${error}`)
       assert.match(error, /model list/, 'the message must point at the model lists, the actual cause')
       assert.ok(
-        !error.includes('No authenticated Antigravity account available'),
+        !error.includes('No authenticated CloudCode Link account available'),
         `a signed-in pool must not be reported as an auth failure, got: ${error}`,
       )
       assert.ok(!error.includes('/ccl auth'), `re-auth cannot fix this, so the message must not ask for it, got: ${error}`)

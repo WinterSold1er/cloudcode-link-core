@@ -5,8 +5,8 @@
 // (agy rejects --effort for Claude/GPT-OSS). Discovery failure falls back to
 // a bundled catalog so the /model picker is never empty.
 import { DEFAULT_FALLBACK_MODELS, type FallbackModelDef, type ModelModality, type PluginConfig } from './types/config-types.ts'
-import type { DiscoveredModelEntry, DiscoveredModelsResponse } from './types/pool-types.ts'
-export type { DiscoveredModelEntry, DiscoveredModelsResponse }
+import type { DiscoveredModelEntry, DiscoveredModelsResponse, ModelUnionSnapshot } from './types/pool-types.ts'
+export type { DiscoveredModelEntry, DiscoveredModelsResponse, ModelUnionSnapshot }
 
 export interface RawModel { slug: string; label: string }
 
@@ -29,6 +29,15 @@ export interface Catalog {
   accountFailures?: ReadonlyArray<{ accountId: string; error: string }>
   /** Endpoint-level discovery errors for observability. */
   endpointErrors?: readonly string[]
+  /**
+   * Catalog provenance: catalog entry id -> the accounts whose last-known model list contains
+   * it (directly or through one of its effort / tiered variants). An entry with an empty list
+   * cannot be served by any usable account, which is what the request path turns into
+   * `MODEL_NOT_AVAILABLE`.
+   */
+  providers?: Record<string, readonly string[]>
+  /** How many accounts the catalog union was composed from. */
+  unionAccounts?: number
 }
 
 /**
@@ -213,12 +222,15 @@ function extractModelList(parsed: unknown): RawModel[] | null {
         // resetTime) and answers live generation requests, yet appears in no sort group, no
         // tieredModelIds list and no defaultAgentModelId. The gate is therefore the server's own
         // signal (numeric quotaInfo.remainingFraction, no disabled / enabled:false / isInternal
-        // flag), never a match on the slug's name.
+        // flag), never a match on the slug's name. The second accepted signal is
+        // `accountListed`: an id some usable account's last-known model list contains, which is
+        // how an account's exclusive models survive that account's own failed probe.
         const published: Array<{ slug: string; rawLabel: string }> = []
         for (const [key, entry] of Object.entries(modelsMap ?? {})) {
           const slug = typeof key === 'string' ? key.trim() : ''
           if (slug === '' || seen.has(slug)) continue
-          if (!entry || typeof entry !== 'object' || !isQuotaPublishedModel(entry)) continue
+          if (!entry || typeof entry !== 'object') continue
+          if (!isQuotaPublishedModel(entry) && entry.accountListed !== true) continue
           if (isInternalModel(slug)) continue
           seen.add(slug)
           published.push({ slug, rawLabel: serverDisplayName(entry) })
@@ -501,21 +513,68 @@ export function mergeDiscoveredWithFallback(
   return result
 }
 
+/** Raw model entries for a composed cross-account union, filtered like the live payload path. */
+function rawFromUnionModels(models: Record<string, DiscoveredModelEntry> | undefined): RawModel[] {
+  const out: RawModel[] = []
+  for (const [key, entry] of Object.entries(models ?? {})) {
+    const slug = typeof key === 'string' ? key.trim() : ''
+    if (slug === '' || isInternalModel(slug)) continue
+    const record = entry as Record<string, unknown> | undefined
+    if (record?.disabled === true || record?.enabled === false || record?.isInternal === true) continue
+    out.push({ slug, label: serverDisplayName(record) })
+  }
+  return out
+}
+
+/** True when `slug` is `base` itself or one of its effort / tiered variants. */
+function isVariantOf(base: string, slug: string): boolean {
+  if (slug === base) return true
+  if (!slug.startsWith(base + '-')) return false
+  const rest = slug.slice(base.length + 1)
+  return rest === 'tiered' || rest.startsWith('tiered-') || EFFORT_SUFFIXES.includes(rest)
+}
+
+/**
+ * Move provenance from raw slugs onto folded entries: a base is served by every account that
+ * lists the base or any of its variants, so `gemini-4-hydrogen` inherits the owners of
+ * `gemini-4-hydrogen-low` / `-xhigh`, while `gemini-4-hydrogen-sonar` stays its own entry.
+ */
+function providersForEntries(
+  entries: readonly CatalogEntry[],
+  providers: Record<string, string[]> | undefined,
+): Record<string, readonly string[]> {
+  const raw = Object.entries(providers ?? {})
+  const out: Record<string, readonly string[]> = {}
+  for (const entry of entries) {
+    const owners = new Set<string>()
+    for (const [slug, accounts] of raw) {
+      if (!isVariantOf(entry.id, slug)) continue
+      for (const accountId of accounts) owners.add(accountId)
+    }
+    out[entry.id] = [...owners]
+  }
+  return out
+}
+
 export class ModelCatalog {
   private current: Catalog;
   private refreshing: Promise<void> | null = null;
   private readonly discover?: DiscoverFn;
   private readonly fallbackDefs: readonly FallbackModelDef[];
   private readonly ttlMs: number;
+  /** Cheap, network-free source of the cross-account model union (see `recomposeFromUnion`). */
+  private readonly unionSource?: () => ModelUnionSnapshot;
 
   constructor(
     discover?: DiscoverFn,
     fallbackDefs: readonly FallbackModelDef[] = DEFAULT_FALLBACK_MODELS,
     ttlMs: number = 300_000,
+    unionSource?: () => ModelUnionSnapshot,
   ) {
     this.discover = discover;
     this.fallbackDefs = fallbackDefs;
     this.ttlMs = ttlMs;
+    this.unionSource = unionSource;
     this.current = {
       source: 'fallback',
       models: buildFallbackCatalog(fallbackDefs),
@@ -532,7 +591,13 @@ export class ModelCatalog {
     if (!this.discover) return;
     if (this.refreshing) return this.refreshing;
     const age = Date.now() - this.current.discoveredAt;
-    if (this.current.source === 'discovered' && age < this.ttlMs) return;
+    if (this.current.source === 'discovered' && age < this.ttlMs) {
+      // Inside the TTL no endpoint is contacted, but the union is folded again from the pool:
+      // an account added or refreshed since the last round reaches the picker without waiting
+      // for the next discovery.
+      if (this.unionSource) this.recomposeFromUnion()
+      return;
+    }
     this.refreshing = this.refresh().finally(() => {
       this.refreshing = null;
     });
@@ -543,6 +608,33 @@ export class ModelCatalog {
     if (!this.discover) return this.current;
     await this.refresh();
     return this.current;
+  }
+
+  /**
+   * Re-fold the cross-account union without contacting an endpoint.
+   *
+   * The union is read from the pool (`QuotaService.composeAvailableModels`), so an account that
+   * was just added, refreshed or removed changes the catalog immediately; an account whose probe
+   * is failing keeps contributing its last-known list. `discoveredAt` is deliberately not moved:
+   * local re-synthesis is not new information from upstream and must not postpone the next probe.
+   */
+  private recomposeFromUnion(): void {
+    const snapshot = this.unionSource?.()
+    if (!snapshot) return
+    const raw = rawFromUnionModels(snapshot.models)
+    if (raw.length === 0) return
+    const folded = foldEfforts(raw)
+    const { lastError, accountFailures, endpointErrors } = this.current
+    this.current = {
+      source: 'discovered',
+      models: folded,
+      discoveredAt: this.current.discoveredAt,
+      providers: providersForEntries(folded, snapshot.providers),
+      unionAccounts: snapshot.accounts.length,
+      ...(lastError !== undefined ? { lastError } : {}),
+      ...(accountFailures ? { accountFailures } : {}),
+      ...(endpointErrors ? { endpointErrors } : {}),
+    };
   }
 
   private async refresh(): Promise<void> {
@@ -582,16 +674,30 @@ export class ModelCatalog {
 
         if (raw.length > 0) {
           const folded = foldEfforts(raw);
-          // A successful discovery is authoritative: the catalog holds exactly the
-          // models upstream serves (after the folding rules), never a union with the
-          // built-in table. `fallbackDefs` stay the initial catalog (constructor) and
-          // the keep-previous-catalog path used when discovery fails.
+          const response = (typeof res === 'object' && res && !Array.isArray(res))
+            ? (res as DiscoveredModelsResponse)
+            : undefined
+          const providers = providersForEntries(folded, response?.modelProviders)
+          const unionAccounts = Array.isArray(response?.catalogAccounts) ? response.catalogAccounts.length : undefined
+          // A discovery answers with the union over every usable account's last-known model
+          // list (see QuotaService.discoverAvailableModels): still exactly what upstream
+          // serves, never a union with the built-in table, but no longer a snapshot of only
+          // the accounts that happened to answer this round. `fallbackDefs` stay the initial
+          // catalog (constructor) and the keep-previous-catalog path used when discovery fails.
+          const allAccountsFailed = typeof response?.discoveredFromAccounts === 'number'
+            && response.discoveredFromAccounts === 0
+            && (accountFailures?.length ?? 0) > 0
           this.current = {
             source: 'discovered',
             models: folded,
             discoveredAt: Date.now(),
+            ...(response?.modelProviders ? { providers } : {}),
+            ...(unionAccounts !== undefined ? { unionAccounts } : {}),
             ...(accountFailures && accountFailures.length > 0 ? { accountFailures } : {}),
             ...(endpointErrors && endpointErrors.length > 0 ? { endpointErrors } : {}),
+            ...(allAccountsFailed
+              ? { lastError: `models discovery failed for all ${accountFailures!.length} account(s); catalog composed from their last-known model lists` }
+              : {}),
           };
           return;
         }

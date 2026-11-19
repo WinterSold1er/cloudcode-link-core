@@ -13,6 +13,8 @@ import {
   type ManagedAccount,
   type ModelFamily,
   type ModelQuotaInfo,
+  type ModelUnionAccount,
+  type ModelUnionSnapshot,
 } from './types/pool-types.ts'
 import type { AccountPoolManager } from './pool.ts'
 import { AGY_ENDPOINTS, OAUTH_USERINFO_URL, refreshTokens } from './oauth.ts'
@@ -499,7 +501,25 @@ export class QuotaService {
     skippedOverBudget: number
     accountFailures: Array<{ accountId: string; error: string }>
     endpointErrors?: string[]
+    /** Accounts that made up the composed catalog union after this round. */
+    unionAccounts?: number
+    /** Per-account contribution to that union, with the origin of each contribution. */
+    catalogAccounts?: ModelUnionAccount[]
+    /** Probes that answered but carried no model list; their roster was kept. */
+    rosterKeptAccounts?: string[]
   }
+
+  /**
+   * Last-known model roster per account — the durable half of the catalog.
+   *
+   * Seeded from pool.json `accounts[].quotas[fam].models` (what `updateAccountQuotas` writes on
+   * every quota refresh) and replaced only by an answer that actually carried a model list:
+   * a `fetchAvailableModels` payload with a `models` map, or a quota refresh that wrote one.
+   * A timeout, a network error, an over-budget skip or a credential failure never replaces it,
+   * so an account's exclusive models stay selectable while that account is briefly unreachable.
+   * Only an account that *answered* with a list missing an id stops vouching for that id.
+   */
+  private readonly modelRosters = new Map<string, { at: number; models: Record<string, DiscoveredModelEntry> }>()
 
   constructor(pool: AccountPoolManager) {
     this.pool = pool
@@ -847,19 +867,191 @@ export class QuotaService {
   }
 
   /**
+   * Accounts the model machinery works on, in deterministic order: primary first (its entries win
+   * id collisions, and if a probe budget runs out the primary is the one already merged), then
+   * pool order. Accounts the user switched off (`enabled: false`) or that need a new credential
+   * (`authRequired`) are excluded: neither can serve a request, so neither may vouch for a model.
+   */
+  private modelPoolOrder(): ManagedAccount[] {
+    const poolData = this.pool.getPoolData()
+    const primaryAcc = poolData.primaryAccountId ? this.pool.getAccount(poolData.primaryAccountId) : undefined
+    const usable = this.pool.getAccounts().filter((a) => a.enabled && !a.authRequired)
+    if (usable.length === 0) return []
+
+    const ordered: ManagedAccount[] = []
+    if (primaryAcc && primaryAcc.enabled && !primaryAcc.authRequired) ordered.push(primaryAcc)
+    for (const acc of usable) {
+      if (!ordered.some((a) => a.id === acc.id)) ordered.push(acc)
+    }
+    return ordered
+  }
+
+  /** Turn one account's persisted `quotas[fam].models` lists into a roster. */
+  private rosterFromPersistedQuotas(account: ManagedAccount): { at: number; models: Record<string, DiscoveredModelEntry> } {
+    const models: Record<string, DiscoveredModelEntry> = {}
+    let at = 0
+    const quotas = account.quotas ?? {}
+    for (const famKey of Object.keys(quotas)) {
+      const family = quotas[famKey as ModelFamily]
+      if (!family) continue
+      if (typeof family.updatedAt === 'number' && family.updatedAt > at) at = family.updatedAt
+      for (const entry of family.models ?? []) {
+        const modelId = typeof entry?.modelId === 'string' ? entry.modelId.trim() : ''
+        if (modelId === '') continue
+        const quotaInfo: DiscoveredModelEntry['quotaInfo'] = {}
+        if (typeof entry.remainingFraction === 'number' && Number.isFinite(entry.remainingFraction)) {
+          quotaInfo.remainingFraction = entry.remainingFraction
+        }
+        if (typeof entry.resetTime === 'string' && entry.resetTime !== '') quotaInfo.resetTime = entry.resetTime
+        models[modelId] = {
+          ...(typeof entry.displayName === 'string' && entry.displayName !== '' ? { displayName: entry.displayName } : {}),
+          ...(quotaInfo.remainingFraction !== undefined ? { quotaInfo } : {}),
+        }
+      }
+    }
+    return { at, models }
+  }
+
+  /** Roster of one account: the in-memory one if we have watched it, else what pool.json says. */
+  private accountModelRoster(account: ManagedAccount): { at: number; models: Record<string, DiscoveredModelEntry> } {
+    const known = this.modelRosters.get(account.id)
+    if (known) return known
+    const seeded = this.rosterFromPersistedQuotas(account)
+    this.modelRosters.set(account.id, seeded)
+    return seeded
+  }
+
+  /**
+   * Record what one account was seen serving.
+   *
+   * `models` must come from an answer that actually carried a model list; the replacement is
+   * total on purpose, because that is how an id an account stopped offering leaves the catalog.
+   * Failed probes must call neither this nor a roster-keeping path.
+   *
+   * The list is mirrored into pool.json for every family that already has a quota entry for this
+   * account, so the catalog union, the entitlement filter in `selectAccount` and the next plugin
+   * restart all agree on what this account serves. Families with no quota entry are left alone
+   * (the roster still vouches for the id) — inventing a family quota from a model payload would
+   * put numbers upstream never gave us into the scheduler's input.
+   */
+  private rememberAccountModels(
+    accountId: string,
+    models: Record<string, DiscoveredModelEntry>,
+    at = Date.now(),
+  ): void {
+    this.modelRosters.set(accountId, { at, models })
+
+    const account = this.pool.getAccount(accountId)
+    if (!account) return
+
+    const refreshed = new Map<ModelFamily, ModelQuotaInfo[]>()
+    for (const [rawId, entry] of Object.entries(models)) {
+      const modelId = typeof rawId === 'string' ? rawId.trim() : ''
+      if (modelId === '') continue
+      const family = modelFamilyOf(modelId)
+      if (!family || !account.quotas[family]) continue
+      const list = refreshed.get(family) ?? []
+      list.push({
+        modelId,
+        ...(entry?.displayName ? { displayName: entry.displayName } : {}),
+        ...(typeof entry?.quotaInfo?.remainingFraction === 'number' && Number.isFinite(entry.quotaInfo.remainingFraction)
+          ? { remainingFraction: entry.quotaInfo.remainingFraction }
+          : {}),
+        ...(typeof entry?.quotaInfo?.resetTime === 'string' && entry.quotaInfo.resetTime !== ''
+          ? { resetTime: entry.quotaInfo.resetTime }
+          : {}),
+      })
+      refreshed.set(family, list)
+    }
+    if (refreshed.size === 0) return
+
+    const quotas: Partial<Record<ModelFamily, FamilyQuotaInfo>> = {}
+    for (const [family, list] of refreshed) {
+      quotas[family] = { ...account.quotas[family], models: list }
+    }
+    this.pool.updateAccountQuotas(accountId, quotas)
+  }
+
+  /**
+   * Union every usable account's last-known model list.
+   *
+   * Cheap and network-free: it reads the pool plus the rosters this process has watched. Same
+   * collision rule as the discovery merge — an id seen on several accounts keeps the entry that
+   * carries `quotaInfo`, otherwise the first one in `modelPoolOrder`. Ids contributed by nobody
+   * are absent, which is what makes "no account serves this" a routable `MODEL_NOT_AVAILABLE`
+   * instead of a phantom catalog entry.
+   */
+  private composeModelUnion(probed: ReadonlySet<string> = new Set()): ModelUnionSnapshot {
+    const live = new Set(this.pool.getAccounts().map((a) => a.id))
+    for (const id of this.modelRosters.keys()) {
+      if (!live.has(id)) this.modelRosters.delete(id)
+    }
+
+    const models = new Map<string, DiscoveredModelEntry>()
+    const providers = new Map<string, string[]>()
+    const accounts: ModelUnionAccount[] = []
+
+    for (const account of this.modelPoolOrder()) {
+      const roster = this.accountModelRoster(account)
+      const ids = Object.keys(roster.models)
+      if (ids.length === 0) continue
+      accounts.push({
+        accountId: account.id,
+        models: ids.length,
+        origin: probed.has(account.id) ? 'probed' : 'last-known',
+      })
+      for (const id of ids) {
+        const entry: DiscoveredModelEntry = { ...(roster.models[id] ?? {}), accountListed: true }
+        const prev = models.get(id)
+        if (!prev) {
+          models.set(id, entry)
+          providers.set(id, [account.id])
+          continue
+        }
+        const owners = providers.get(id)
+        if (owners && !owners.includes(account.id)) owners.push(account.id)
+        if (prev.quotaInfo === undefined && entry.quotaInfo !== undefined) models.set(id, entry)
+      }
+    }
+
+    return {
+      models: Object.fromEntries(models),
+      providers: Object.fromEntries(providers),
+      accounts,
+    }
+  }
+
+  /**
+   * Public half of the union: the catalog's cheap local re-synthesis.
+   *
+   * No endpoint is contacted, no token is read, so the model list can follow pool changes
+   * (account added, quota refreshed, account removed) without waiting for a discovery round.
+   */
+  composeAvailableModels(): ModelUnionSnapshot {
+    return this.composeModelUnion()
+  }
+
+  /**
    * Discover the models this installation can actually serve.
    *
    * Upstream answers per account: an id can be missing from the primary account's
-   * `fetchAvailableModels` payload yet present in a pooled secondary account. So the
-   * whole usable pool is fetched and the `models` maps are unioned by model id —
-   * same id in several accounts keeps the entry that carries `quotaInfo`, otherwise
-   * the first one seen (primary account first). A single failing account never fails
-   * the discovery; only an all-failed pool returns null (which makes ModelCatalog
-   * keep its previous catalog and record `lastError`).
+   * `fetchAvailableModels` payload yet present in a pooled secondary account. So the whole
+   * usable pool is fetched and the answer is the **union over every usable account's
+   * last-known model list** — an account that answered contributes what it just reported,
+   * an account that timed out or errored contributes what it was last seen serving
+   * (pool.json `accounts[].quotas[fam].models`). An id therefore leaves the catalog only when
+   * every account that vouched for it has since answered with a list that omits it; a failing
+   * probe can never delete a model.
    *
-   * Budget: at most `concurrency` accounts in flight, `accountTimeoutMs` per account,
-   * and `totalBudgetMs` overall — accounts started after the budget is exhausted are
-   * skipped rather than delaying the merge.
+   * Same id in several accounts keeps the entry that carries `quotaInfo`, otherwise the first
+   * one seen (primary account first). `models` also carries `accountListed` provenance and
+   * `modelProviders` maps each id to the accounts that list it.
+   *
+   * Budget: at most `concurrency` accounts in flight, `accountTimeoutMs` per account, and
+   * `totalBudgetMs` overall — accounts started after the budget is exhausted are skipped rather
+   * than delaying the merge, and a skipped account still contributes its last-known list.
+   * An all-failed pool with no persisted list anywhere returns null (which makes ModelCatalog
+   * keep its previous catalog and record `lastError`).
    */
   async discoverAvailableModels(options?: {
     concurrency?: number
@@ -870,29 +1062,24 @@ export class QuotaService {
       return this.fetchAvailableModels(process.env.ANTIGRAVITY_TOKEN.trim())
     }
 
-    const poolData = this.pool.getPoolData()
-    const primaryAcc = poolData.primaryAccountId ? this.pool.getAccount(poolData.primaryAccountId) : undefined
-    const usable = this.pool.getAccounts().filter((a) => a.enabled && !a.authRequired)
-    if (usable.length === 0) return null
-
     // Primary first: its entries win id collisions, and if the budget runs out the
     // primary account's models are the ones already merged.
-    const ordered: ManagedAccount[] = []
-    if (primaryAcc && primaryAcc.enabled && !primaryAcc.authRequired) ordered.push(primaryAcc)
-    for (const acc of usable) {
-      if (!ordered.some((a) => a.id === acc.id)) ordered.push(acc)
-    }
+    const ordered = this.modelPoolOrder()
+    if (ordered.length === 0) return null
 
     const concurrency = Math.max(1, Math.min(options?.concurrency ?? DISCOVER_MAX_CONCURRENCY, ordered.length))
     const accountTimeoutMs = options?.accountTimeoutMs ?? DISCOVER_ACCOUNT_TIMEOUT_MS
     const deadline = Date.now() + (options?.totalBudgetMs ?? DISCOVER_TOTAL_BUDGET_MS)
 
-    const merged = new Map<string, DiscoveredModelEntry>()
     const accountSorts = new Map<string, DiscoveredModelsResponse['agentModelSorts']>()
     let succeeded = 0
     let failures = 0
     let skippedOverBudget = 0
     const failureDetails: Array<{ accountId: string; error: string }> = []
+    /** Accounts whose probe answered without a model list; their last-known roster stays in force. */
+    const rosterKept: string[] = []
+    /** Accounts that answered this round; their roster is the fresh one. */
+    const probed = new Set<string>()
 
     let cursor = 0
     const fetchOne = async (acc: ManagedAccount): Promise<{ res: DiscoveredModelsResponse | null; error?: string }> => {
@@ -937,15 +1124,15 @@ export class QuotaService {
           if (Array.isArray(res.agentModelSorts) && res.agentModelSorts.length > 0) {
             accountSorts.set(acc.id, res.agentModelSorts)
           }
-          for (const [modelId, entry] of Object.entries(res.models ?? {})) {
-            const prev = merged.get(modelId)
-            if (!prev) {
-              merged.set(modelId, entry ?? {})
-              continue
-            }
-            const prevHasQuota = prev.quotaInfo !== undefined
-            const nextHasQuota = entry?.quotaInfo !== undefined
-            if (!prevHasQuota && nextHasQuota) merged.set(modelId, entry)
+          if (res.models && typeof res.models === 'object' && !Array.isArray(res.models)) {
+            // The account answered with a model list: from now on that list is the only thing
+            // this account vouches for, so an id it dropped stops being vouched for here.
+            this.rememberAccountModels(acc.id, res.models)
+            probed.add(acc.id)
+          } else {
+            // A payload with no model list says nothing about what the account serves. Keeping
+            // the last-known roster is not an upstream failure, so it is filed on its own.
+            rosterKept.push(acc.id)
           }
         } catch (err) {
           // One account must never sink the discovery: keep what the others returned.
@@ -956,7 +1143,25 @@ export class QuotaService {
     })
     await Promise.allSettled(workers)
 
-    if (succeeded === 0 || merged.size === 0) return null
+    // The catalog is the union over every usable account's last-known list, not a snapshot of
+    // the accounts that happened to answer this round.
+    const union = this.composeModelUnion(probed)
+
+    this.lastDiscoveryDiagnostics = {
+      at: Date.now(),
+      succeeded,
+      failures,
+      skippedOverBudget,
+      accountFailures: failureDetails,
+      endpointErrors: this.lastEndpointErrors,
+      unionAccounts: union.accounts.length,
+      catalogAccounts: union.accounts,
+      ...(rosterKept.length > 0 ? { rosterKeptAccounts: rosterKept } : {}),
+    }
+
+    // Nothing anywhere: no account answered and no account has a persisted list. Only now is
+    // there nothing to report, and ModelCatalog keeps its previous catalog / built-in table.
+    if (union.accounts.length === 0) return null
 
     // Deterministically merge agentModelSorts in fixed ordered account sequence (primary first)
     let primarySorts: DiscoveredModelsResponse['agentModelSorts'] = undefined
@@ -967,23 +1172,18 @@ export class QuotaService {
       }
     }
 
-    this.lastDiscoveryDiagnostics = {
-      at: Date.now(),
-      succeeded,
-      failures,
-      skippedOverBudget,
-      accountFailures: failureDetails,
-      endpointErrors: this.lastEndpointErrors,
-    }
-
     return {
-      models: Object.fromEntries(merged),
+      models: union.models,
       ...(primarySorts ? { agentModelSorts: primarySorts } : {}),
       discoveredFromAccounts: succeeded,
       discoveredAccountFailures: failures,
       discoveredSkippedOverBudget: skippedOverBudget,
       accountFailures: failureDetails,
       endpointErrors: this.lastEndpointErrors,
+      catalogAccounts: union.accounts,
+      unionAccounts: union.accounts.length,
+      modelProviders: union.providers,
+      ...(rosterKept.length > 0 ? { rosterKeptAccounts: rosterKept } : {}),
     }
   }
 
@@ -1162,6 +1362,25 @@ export class QuotaService {
     }
 
     this.pool.updateAccountQuotas(account.id, familyQuotas, email)
+
+    // The persisted per-family breakdown is the account's own statement about what it serves.
+    // Mirror it into the roster so the catalog union, the entitlement filter and pool.json agree;
+    // a refresh that produced no breakdown leaves the roster untouched.
+    const brokenDown: Record<string, DiscoveredModelEntry> = {}
+    for (const famKey of Object.keys(familyQuotas)) {
+      for (const entry of familyQuotas[famKey as ModelFamily]?.models ?? []) {
+        const modelId = typeof entry?.modelId === 'string' ? entry.modelId.trim() : ''
+        if (modelId === '') continue
+        brokenDown[modelId] = {
+          ...(entry.displayName ? { displayName: entry.displayName } : {}),
+          ...(typeof entry.remainingFraction === 'number' && Number.isFinite(entry.remainingFraction)
+            ? { quotaInfo: { remainingFraction: entry.remainingFraction, ...(entry.resetTime ? { resetTime: entry.resetTime } : {}) } }
+            : {}),
+        }
+      }
+    }
+    if (Object.keys(brokenDown).length > 0) this.rememberAccountModels(account.id, brokenDown, now)
+
     return familyQuotas
   }
 

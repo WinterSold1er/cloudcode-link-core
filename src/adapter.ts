@@ -53,10 +53,11 @@ export class AgyAdapter {
     this.deps = deps
   }
 
+  // 宿主走 src/host/adapter.ts；此处仅测试副本。
   providerInfo(provider: string): { id: string; name: string } {
     return {
       id: provider,
-      name: 'Google Antigravity',
+      name: 'CloudCode Link',
     }
   }
 

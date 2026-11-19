@@ -137,7 +137,7 @@ export async function runAgyOnce(
           text: '',
           conversationId: null,
           error:
-            `No signed-in Antigravity account serves ${wireModel}: every account's model list ` +
+            `No signed-in CloudCode Link account serves ${wireModel}: every account's model list ` +
             `excludes it, and no request was sent. Choose a model your accounts actually serve.`,
           durationMs: Date.now() - startTime,
         }
@@ -146,7 +146,7 @@ export async function runAgyOnce(
         ok: false,
         text: '',
         conversationId: null,
-        error: 'No authenticated Antigravity account available.',
+        error: 'No authenticated CloudCode Link account available.',
         durationMs: Date.now() - startTime,
       }
     }
