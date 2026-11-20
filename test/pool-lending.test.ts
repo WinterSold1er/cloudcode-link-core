@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import {
   AccountPoolManager,
   hasModelCapability,
+  modelEntitlementOf,
   type CapableAccountResult,
 } from '../src/pool.ts'
 import type { ManagedAccount } from '../src/types/pool-types.ts'
@@ -353,6 +354,90 @@ test('6. getBroadcastedCatalogModels does not inject G4 models when no pool acco
     assert.equal(catalog.includes('gemini-4-hydrogen'), false, 'G4 models should not be injected if no account has G4')
     assert.equal(catalog.includes('gemini-4-argon'), false)
     assert.equal(catalog.includes('gemini-4-hydrogen-sonar'), false)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('7. modelEntitlementOf grants gemini-4-hydrogen-sonar to G4 (argon/hydrogen) accounts without leaking ladder models to sonar-only accounts', () => {
+  const argonAcc = createTestAccount('acc-argon', 'argon@example.com', [
+    { modelId: 'gemini-4-argon-low' },
+    { modelId: 'gemini-3.8-pro' },
+  ])
+  const hydrogenAcc = createTestAccount('acc-hydrogen', 'hydrogen@example.com', [
+    { modelId: 'gemini-4-hydrogen-high' },
+  ])
+  const sonarOnlyAcc = createTestAccount('acc-sonar-only', 'sonar@example.com', [
+    { modelId: 'gemini-4-hydrogen-sonar' },
+  ])
+  const legacyAcc = createTestAccount('acc-legacy', 'legacy@example.com', [
+    { modelId: 'gemini-3.8-pro' },
+    { modelId: 'gemini-2.5-flash' },
+  ])
+
+  // G4 accounts (argon / hydrogen) must be entitled to gemini-4-hydrogen-sonar and other gemini-4-* models
+  assert.equal(modelEntitlementOf(argonAcc, 'google', 'gemini-4-hydrogen-sonar').supported, true)
+  assert.equal(modelEntitlementOf(argonAcc, 'google', 'gemini-4-hydrogen-high').supported, true)
+  assert.equal(modelEntitlementOf(argonAcc, 'google', 'gemini-4-neon').supported, true)
+  assert.equal(modelEntitlementOf(hydrogenAcc, 'google', 'gemini-4-hydrogen-sonar').supported, true)
+  assert.equal(modelEntitlementOf(hydrogenAcc, 'google', 'gemini-4-argon-medium').supported, true)
+
+  // Sonar-only account is entitled to sonar, NOT to ladder models
+  assert.equal(modelEntitlementOf(sonarOnlyAcc, 'google', 'gemini-4-hydrogen-sonar').supported, true)
+  assert.equal(modelEntitlementOf(sonarOnlyAcc, 'google', 'gemini-4-hydrogen-medium').supported, false)
+  assert.equal(modelEntitlementOf(sonarOnlyAcc, 'google', 'gemini-4-argon-high').supported, false)
+
+  // Non-G4 account is NOT entitled to gemini-4-hydrogen-sonar
+  assert.equal(modelEntitlementOf(legacyAcc, 'google', 'gemini-4-hydrogen-sonar').supported, false)
+})
+
+test('8. getCapableAccount resolves gemini-4-hydrogen-sonar via G4 argon account directly and via lending', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agy-lending-sonar-'))
+  try {
+    const regId = 'acc-reg-38'
+    const g4Id = 'acc-g4-argon'
+    const poolData = {
+      version: 1,
+      mode: 'round-robin',
+      defaultCooldownMs: 900000,
+      maxCooldownMs: 3600000,
+      accounts: [
+        createTestAccount(regId, 'regular@example.com', [
+          { modelId: 'gemini-3.8-pro' },
+          { modelId: 'gemini-2.5-flash' },
+        ]),
+        createTestAccount(g4Id, 'g4@example.com', [
+          { modelId: 'gemini-4-argon-low' },
+          { modelId: 'gemini-3.8-pro' },
+        ]),
+      ],
+    }
+    writeFileSync(join(dir, 'pool.json'), JSON.stringify(poolData, null, 2))
+
+    const pool = new AccountPoolManager(dir)
+
+    // Direct request with preferred G4 account (no literal gemini-4-hydrogen-sonar in quota list)
+    const directRes = pool.getCapableAccount('gemini-4-hydrogen-sonar', g4Id)
+    assert.ok(directRes, 'G4 argon account must serve gemini-4-hydrogen-sonar directly')
+    assert.equal(directRes.account.id, g4Id)
+    assert.equal(directRes.borrowedFrom, undefined)
+    assert.equal(directRes.modelToUse, 'gemini-4-hydrogen-sonar')
+    assert.equal(directRes.isFallback, false)
+
+    // Request with preferred non-G4 account -> must lend from G4 argon account, never return null
+    const lendRes = pool.getCapableAccount('gemini-4-hydrogen-sonar', regId)
+    assert.ok(lendRes, 'Non-G4 preferred account must borrow G4 argon account for gemini-4-hydrogen-sonar')
+    assert.equal(lendRes.account.id, regId)
+    assert.equal(lendRes.borrowedFrom?.id, g4Id)
+    assert.equal(lendRes.modelToUse, 'gemini-4-hydrogen-sonar')
+    assert.equal(lendRes.isFallback, false)
+
+    // Auto-selection without preferred account -> must resolve G4 argon account
+    const autoRes = pool.getCapableAccount('gemini-4-hydrogen-sonar')
+    assert.ok(autoRes, 'Auto-selection must resolve G4 argon account for gemini-4-hydrogen-sonar')
+    assert.equal(autoRes.account.id, g4Id)
+    assert.equal(autoRes.modelToUse, 'gemini-4-hydrogen-sonar')
+    assert.equal(autoRes.isFallback, false)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
