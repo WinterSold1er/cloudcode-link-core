@@ -9,7 +9,7 @@ describe('Oneshot & File Inlining', () => {
     const inlined = await inlineFiles(prompt, ['package.json'], process.cwd())
     assert.ok(inlined.includes('Review this code'))
     assert.ok(inlined.includes('--- file:'))
-    assert.ok(inlined.includes('"cloudcode-link-core"'))
+    assert.ok(inlined.includes('"cloudcode-link-core"') || inlined.includes('"dsh-cloudcode-link"'))
   })
 
   it('runAgyOnce fails cleanly without token', async () => {

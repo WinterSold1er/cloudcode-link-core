@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { agyFetch } from './net.ts'
-import { lookupModelEnum } from './models.ts'
+import { lookupModelEnum, isDailyEndpointModel } from './models.ts'
 import { buildAgyCliUserAgent } from './quota.ts'
 import { fnv1a64Signed } from './sessions.ts'
 
@@ -240,6 +240,26 @@ export function endpointCandidates(customBaseUrl?: string): string[] {
   const explicit = customBaseUrl?.trim() || process.env.ANTIGRAVITY_BASE_URL?.trim()
   if (explicit) {
     return [explicit.replace(/\/+$/, '')]
+  }
+  return [...ENDPOINT_FALLBACKS]
+}
+
+/**
+ * Return endpoint candidates prioritized for the requested model.
+ * Gemini 4 generation models (argon, hydrogen, etc.) are strictly routed daily-first
+ * because production endpoints return HTTP 429 for Gemini 4 requests.
+ */
+export function getEndpointCandidatesForModel(model: string, customBaseUrl?: string): string[] {
+  const explicit = customBaseUrl?.trim() || process.env.ANTIGRAVITY_BASE_URL?.trim()
+  if (explicit) {
+    return [explicit.replace(/\/+$/, '')]
+  }
+  if (isDailyEndpointModel(model)) {
+    return [
+      'https://daily-cloudcode-pa.googleapis.com',
+      'https://daily-cloudcode-pa.sandbox.googleapis.com',
+      DEFAULT_ENDPOINT,
+    ]
   }
   return [...ENDPOINT_FALLBACKS]
 }
@@ -1081,7 +1101,7 @@ export async function streamGenerateContent(
   proxyUrl?: string,
   customEndpoints?: string[],
 ): Promise<{ response: Response; endpoint: string }> {
-  const endpoints = customEndpoints && customEndpoints.length ? customEndpoints : endpointCandidates()
+  const endpoints = customEndpoints && customEndpoints.length ? customEndpoints : getEndpointCandidatesForModel(request.model)
   const isClaude = request.model.startsWith('claude-')
   const headers: Record<string, string> = {
     ...antigravityHeaders(token),

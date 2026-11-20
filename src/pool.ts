@@ -14,6 +14,7 @@ import {
   type ModelFamily,
 } from './types/pool-types.ts'
 import { parseResetDurationMs } from './types/config-types.ts'
+import { isGemini4Model } from './models.ts'
 
 export function defaultPoolDir(customBase?: string): string {
   if (customBase) return customBase
@@ -96,7 +97,20 @@ export function modelBaseOf(modelId: string): string {
 export function isServableModelId(modelId: string): boolean {
   const id = modelId.trim().toLowerCase()
   if (!id) return false
-  return !MODEL_UNSERVABLE_SUFFIXES.some((marker) => id === marker || id.endsWith(`-${marker}`))
+  if (id === 'disabled' || id.endsWith('-disabled') || id.includes('-disabled')) {
+    return false
+  }
+  return !MODEL_UNSERVABLE_SUFFIXES.some(
+    (marker) => id === marker || id.endsWith(`-${marker}`) || id.includes(`-${marker}-`),
+  )
+}
+
+/** Result of resolving an account capable of serving a specific model (including capability lending). */
+export interface CapableAccountResult {
+  account: ManagedAccount
+  borrowedFrom?: ManagedAccount
+  modelToUse: string
+  isFallback: boolean
 }
 
 /**
@@ -122,7 +136,13 @@ export function modelEntitlementOf(
   const supported = listing.some((entry) => {
     const listed = typeof entry.modelId === 'string' ? entry.modelId.trim().toLowerCase() : ''
     if (!listed || !isServableModelId(listed)) return false
-    return listed === requested || modelBaseOf(listed) === base
+    const listedBase = modelBaseOf(listed)
+    return (
+      listed === requested ||
+      listedBase === base ||
+      (base === 'gemini-4-hydrogen' && listedBase === 'gemini-4-argon') ||
+      (base === 'gemini-4-argon' && listedBase === 'gemini-4-hydrogen')
+    )
   })
   return { base, known: true, supported }
 }
@@ -156,6 +176,17 @@ export class Semaphore {
     const next = this.queue.shift()
     if (next) next()
   }
+}
+
+/** Check if a specific account natively has entitlement for wireModel. */
+export function hasModelCapability(account: ManagedAccount, wireModel: string): boolean {
+  if (!wireModel || !wireModel.trim()) return false
+  const trimmed = wireModel.trim()
+  if (!isServableModelId(trimmed)) return false
+  const family = modelFamilyOf(trimmed)
+  const listing = account.quotas[family]?.models
+  if (!Array.isArray(listing) || listing.length === 0) return false
+  return modelEntitlementOf(account, family, trimmed).supported
 }
 
 export class AccountPoolManager {
@@ -1022,5 +1053,176 @@ export class AccountPoolManager {
       reason,
       resetInMs,
     }
+  }
+
+  /** Check if a specific account natively has entitlement for wireModel. */
+  hasModelCapability(account: ManagedAccount, wireModel: string): boolean {
+    return hasModelCapability(account, wireModel)
+  }
+
+  /** Check if any account in the pool (even if in cooldown) has entitlement for wireModel. */
+  isModelKnownInPool(wireModel: string): boolean {
+    const family = modelFamilyOf(wireModel)
+    return this.data.accounts.some((acc) => acc.enabled && this.hasModelCapability(acc, wireModel))
+  }
+
+  /**
+   * Dynamically find a healthy account in the pool that natively supports wireModel.
+   * Never hardcodes account IDs or emails; dynamically probes pool account quotas.
+   */
+  findCapableAccount(family: ModelFamily, wireModel: string): ManagedAccount | null {
+    const candidates = this.data.accounts.filter(
+      (acc) =>
+        this.isAccountHealthy(acc, family) &&
+        this.hasModelCapability(acc, wireModel) &&
+        !this.getModelQuarantine(acc.id, family, wireModel),
+    )
+    if (candidates.length === 0) return null
+    return (
+      candidates.slice().sort((a, b) => {
+        const aFrac = a.quotas[family]?.remainingFraction ?? 1.0
+        const bFrac = b.quotas[family]?.remainingFraction ?? 1.0
+        return bFrac - aFrac
+      })[0] ?? null
+    )
+  }
+
+  /**
+   * Resolve an account capable of serving wireModel, leveraging capability lending if necessary.
+   * If preferredAccountId is healthy but lacks native entitlement (e.g. regular account requesting
+   * high-tier Gemini 4), transparently borrows a privileged account's credentials while keeping
+   * session affinity. If no privileged account is available, falls back to gemini-4-hydrogen-sonar.
+   */
+  getCapableAccount(wireModel: string, preferredAccountId?: string): CapableAccountResult | null {
+    const family = modelFamilyOf(wireModel)
+    const preferred = preferredAccountId ? this.getAccount(preferredAccountId) ?? null : this.getPinnedAccount()
+
+    // 1. Preferred account exists, is healthy, and natively supports wireModel
+    if (preferred && this.isAccountHealthy(preferred, family) && this.hasModelCapability(preferred, wireModel)) {
+      return {
+        account: preferred,
+        modelToUse: wireModel,
+        isFallback: false,
+      }
+    }
+
+    // 2. Preferred account exists and is healthy for family, but lacks native entitlement for wireModel
+    if (preferred && this.isAccountHealthy(preferred, family)) {
+      const capable = this.findCapableAccount(family, wireModel)
+      if (capable && capable.id !== preferred.id) {
+        console.log(
+          '[G4-Lend] Borrowing account ' +
+            capable.id +
+            ' (' +
+            capable.email +
+            ') for ' +
+            preferred.id +
+            ' (' +
+            preferred.email +
+            ') to serve ' +
+            wireModel,
+        )
+        return {
+          account: preferred,
+          borrowedFrom: capable,
+          modelToUse: wireModel,
+          isFallback: false,
+        }
+      }
+      if (this.isModelKnownInPool(wireModel) && isGemini4Model(wireModel) && wireModel !== 'gemini-4-hydrogen-sonar') {
+        return {
+          account: preferred,
+          modelToUse: 'gemini-4-hydrogen-sonar',
+          isFallback: true,
+        }
+      }
+      return null
+    }
+
+    // 3. No preferred account or preferred is unhealthy: select an account from pool
+    const nativeAccount = this.selectAccount(family, wireModel)
+    if (nativeAccount) {
+      return {
+        account: nativeAccount,
+        modelToUse: wireModel,
+        isFallback: false,
+      }
+    }
+
+    const candidate = this.selectAccount(family)
+    if (candidate) {
+      const capable = this.findCapableAccount(family, wireModel)
+      if (capable && capable.id !== candidate.id) {
+        console.log(
+          '[G4-Lend] Borrowing account ' +
+            capable.id +
+            ' (' +
+            capable.email +
+            ') for ' +
+            candidate.id +
+            ' (' +
+            candidate.email +
+            ') to serve ' +
+            wireModel,
+        )
+        return {
+          account: candidate,
+          borrowedFrom: capable,
+          modelToUse: wireModel,
+          isFallback: false,
+        }
+      }
+      if (this.isModelKnownInPool(wireModel) && isGemini4Model(wireModel) && wireModel !== 'gemini-4-hydrogen-sonar') {
+        return {
+          account: candidate,
+          modelToUse: 'gemini-4-hydrogen-sonar',
+          isFallback: true,
+        }
+      }
+      return null
+    }
+
+    return null
+  }
+
+  /**
+   * Broadcast model catalog union across all pool accounts.
+   * If any account has Gemini 4 capability (or G4 is enabled), Gemini 4 models are broadcast
+   * to all accounts in the pool.
+   */
+  getBroadcastedCatalogModels(family: ModelFamily): string[] {
+    const allModels = new Set<string>()
+    for (const acc of this.data.accounts) {
+      if (!acc.enabled || acc.authRequired) continue
+      const listing = acc.quotas[family]?.models
+      if (Array.isArray(listing)) {
+        for (const m of listing) {
+          const modelId = typeof m === 'string' ? m : m?.modelId
+          if (typeof modelId === 'string' && isServableModelId(modelId)) {
+            allModels.add(modelId.trim())
+          }
+        }
+      }
+    }
+    let hasG4 = Array.from(allModels).some(isGemini4Model)
+    if (!hasG4) {
+      for (const acc of this.data.accounts) {
+        if (!acc.enabled || acc.authRequired) continue
+        if (
+          this.hasModelCapability(acc, 'gemini-4-hydrogen') ||
+          this.hasModelCapability(acc, 'gemini-4-argon') ||
+          this.hasModelCapability(acc, 'gemini-4-hydrogen-sonar')
+        ) {
+          hasG4 = true
+          break
+        }
+      }
+    }
+    if (hasG4) {
+      allModels.add('gemini-4-hydrogen')
+      allModels.add('gemini-4-hydrogen-sonar')
+      allModels.add('gemini-4-argon')
+    }
+    return Array.from(allModels)
   }
 }

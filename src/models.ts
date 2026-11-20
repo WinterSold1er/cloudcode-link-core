@@ -84,9 +84,30 @@ export function isInternalModel(slug: string): boolean {
     /^tab[_-]/i.test(s) ||
     /_preview$/i.test(s) ||
     /-preview$/i.test(s) ||
+    s.includes('-disabled') ||
+    s.endsWith('disabled') ||
     /-disabled(?:-|$)/i.test(s) ||
+    s.endsWith('-disabled') ||
+    s.includes('-disabled-') ||
     /-tiered-/i.test(s)
   )
+}
+
+/** Check if a model belongs to the Gemini 4 generation (argon, hydrogen, neon, carbon). */
+export function isGemini4Model(modelId: string): boolean {
+  const s = modelId.trim().toLowerCase()
+  return (
+    s.startsWith('gemini-4') ||
+    s.includes('hydrogen') ||
+    s.includes('argon') ||
+    s.includes('neon') ||
+    s.includes('carbon')
+  )
+}
+
+/** Determine if a model requires routing to daily endpoints first (Gemini 4 models). */
+export function isDailyEndpointModel(modelId: string): boolean {
+  return isGemini4Model(modelId)
 }
 
 /** Parse `agy models` stdout: JSON shapes first, then two-column text. */
@@ -319,7 +340,7 @@ function extractModelList(parsed: unknown): RawModel[] | null {
   return out;
 }
 
-const EFFORT_SUFFIXES = ['low', 'medium', 'high', 'xhigh']
+export const EFFORT_SUFFIXES = ['low', 'medium', 'high', 'xhigh'] as const
 
 export function getInputModalitiesForModel(modelId: string): readonly ModelModality[] {
   const wire = resolveModelSlug(modelId).toLowerCase()
@@ -531,7 +552,7 @@ function isVariantOf(base: string, slug: string): boolean {
   if (slug === base) return true
   if (!slug.startsWith(base + '-')) return false
   const rest = slug.slice(base.length + 1)
-  return rest === 'tiered' || rest.startsWith('tiered-') || EFFORT_SUFFIXES.includes(rest)
+  return rest === 'tiered' || rest.startsWith('tiered-') || (EFFORT_SUFFIXES as readonly string[]).includes(rest)
 }
 
 /**
@@ -1229,7 +1250,7 @@ export function getAntigravityRequestModelId(modelId: string, effort?: string): 
       resolvedId.endsWith('-tiered') ||
       resolvedId.endsWith('-extra-low') ||
       resolvedId.endsWith('-thinking')
-    if (/^gemini-(?:[3-9]|\d{2,})(?:[.-]|$)/i.test(resolvedId) && !isWireModel) {
+    if ((isGemini4Model(resolvedId) || /^gemini-(?:[3-9]|\d{2,})(?:[.-]|$)/i.test(resolvedId)) && !isWireModel) {
       if (effort && effort !== 'off' && ['low', 'medium', 'high', 'xhigh'].includes(effort.toLowerCase())) {
         return `${resolvedId}-${effort.toLowerCase()}`
       }

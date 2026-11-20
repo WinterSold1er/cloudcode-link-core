@@ -23,6 +23,7 @@ import {
   type ManagedAccount,
   type ModelFamily,
 } from './types/pool-types.ts'
+import { prettifyModelSlug } from './models.ts'
 
 /** Rendering order for the family list: named providers first, undetermined last. */
 export const MODEL_FAMILY_ORDER: readonly ModelFamily[] = ['google', 'anthropic', 'openai', 'unknown']
@@ -133,7 +134,10 @@ function familyQuotaSummary(info: FamilyQuotaInfo | undefined): AccountFamilyQuo
  * Normalize one account's recorded model entitlements. Read-only: `account` is never mutated,
  * every returned object is freshly built, and no clock or I/O is touched.
  */
-export function describeAccountModels(account: ManagedAccount): AccountModelCatalog {
+export function describeAccountModels(
+  account: ManagedAccount,
+  poolBroadcastModels?: readonly string[],
+): AccountModelCatalog {
   const quotas = account.quotas ?? {}
   const byFamily = new Map<ModelFamily, Map<string, AccountModelEntry>>()
 
@@ -144,6 +148,21 @@ export function describeAccountModels(account: ManagedAccount): AccountModelCata
       byFamily.set(family, bucket)
     }
     return bucket
+  }
+
+  // Inject broadcast models (e.g. Gemini 4 capability broadcast across pool)
+  if (poolBroadcastModels && poolBroadcastModels.length > 0) {
+    for (const id of poolBroadcastModels) {
+      const family = modelFamilyOf(id)
+      const bucket = bucketFor(family)
+      if (!bucket.has(id)) {
+        bucket.set(id, {
+          id,
+          name: prettifyModelSlug(id) || id,
+          family,
+        })
+      }
+    }
   }
 
   // Any recorded key is walked (a malformed key still describes real models), but the family a
@@ -214,6 +233,8 @@ export interface AccountModelsDeps {
   getAccount: (id: string) => ManagedAccount | undefined
   /** Typically `QuotaService.refreshAccountQuota(account, true)`. Absent = refresh unsupported. */
   refreshQuota?: (account: ManagedAccount) => unknown
+  /** Optional model broadcaster across accounts in the pool. */
+  getBroadcastedModels?: (family: ModelFamily) => string[]
 }
 
 /** Status + JSON body, ready for `sendJson`. No HTTP types, so it is testable without a server. */
@@ -265,7 +286,8 @@ export async function handleAccountModels(
     }
   }
 
-  const catalog = describeAccountModels(account)
+  const broadcasted = deps.getBroadcastedModels ? deps.getBroadcastedModels('google') : undefined
+  const catalog = describeAccountModels(account, broadcasted)
   const alias = trimmedString(account.alias)
   const email = trimmedString(account.email)
 
