@@ -59,12 +59,18 @@ function extractAttachmentsFromBlocks(blocks: ContentBlock[]): RobinAttachment[]
   return attachments
 }
 
-export function formatMessagesToPrompt(messages: Message[]): {
+export function formatMessagesToPrompt(
+  messages: Message[],
+  systemPrompt?: string,
+): {
   promptText: string
   attachments: RobinAttachment[]
 } {
   const allAttachments: RobinAttachment[] = []
   const systemLines: string[] = []
+  if (typeof systemPrompt === 'string' && systemPrompt.trim()) {
+    systemLines.push(systemPrompt.trim())
+  }
   const conversationLines: string[] = []
 
   for (const msg of messages) {
@@ -120,7 +126,7 @@ export function buildProcessQueryRequest(
   options: GenerateOptions,
   config?: GeminiAppConfig,
 ): ProcessQueryRequest {
-  const { promptText, attachments } = formatMessagesToPrompt(options.messages)
+  const { promptText, attachments } = formatMessagesToPrompt(options.messages, options.system)
 
   const sessionInput: SessionInput = {
     textPrompt: promptText,

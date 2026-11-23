@@ -63,6 +63,8 @@ export interface ChatHistoryOutput {
   fullText?: string
   candidateId?: string
   thoughtsText?: string
+  conversationId?: string
+  responseId?: string
 }
 
 export interface RobinPunt {
@@ -80,6 +82,8 @@ export interface ProcessQueryResponse {
   streamingState?: RobinStreamingState
   punt?: RobinPunt
   error?: RobinError
+  conversationId?: string
+  responseId?: string
 }
 
 export interface GeminiAppConfig {

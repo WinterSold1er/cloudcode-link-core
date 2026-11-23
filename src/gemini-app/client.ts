@@ -13,7 +13,7 @@ import {
   type ProcessQueryResponse,
 } from './types.ts'
 import {
-  encodeProcessQueryRequest,
+  encodeProcessQueryFrames,
   decodeProcessQueryResponse,
   encodeGrpcFrame,
   decodeGrpcFrames,
@@ -253,11 +253,18 @@ export class GeminiAppClient {
     }
 
     const endpoint = this.config.endpoint || ROBIN_DEFAULT_ENDPOINT
-    const requestProto = encodeProcessQueryRequest(request)
-    const grpcFrame = encodeGrpcFrame(requestProto)
+    const requestFrames = encodeProcessQueryFrames(request).map((frame) => encodeGrpcFrame(frame))
+    const totalLen = requestFrames.reduce((sum, f) => sum + f.length, 0)
+    const grpcPayload = new Uint8Array(totalLen)
+    let offset = 0
+    for (const f of requestFrames) {
+      grpcPayload.set(f, offset)
+      offset += f.length
+    }
 
     const headers: Record<string, string> = {
       'content-type': 'application/grpc',
+      'grpc-accept-encoding': 'gzip',
       te: 'trailers',
       authorization: `Bearer ${token}`,
       'user-agent': ROBIN_DEFAULT_USER_AGENT,
@@ -266,7 +273,7 @@ export class GeminiAppClient {
 
     let transportResult: GeminiAppTransportResult
     try {
-      transportResult = await this.transport(endpoint, headers, grpcFrame, signal)
+      transportResult = await this.transport(endpoint, headers, grpcPayload, signal)
     } catch (err) {
       const isAbort = signal?.aborted
       yield {

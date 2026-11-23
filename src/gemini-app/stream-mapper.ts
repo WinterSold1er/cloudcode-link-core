@@ -106,9 +106,10 @@ export async function* mapRobinResponsesToChunks(
 
         // Output Text
         let textToEmit = deltaText
-        if (!textToEmit && fullText && currentBlock?.type === 'text') {
-          if (fullText.length > currentBlock.text.length) {
-            textToEmit = fullText.slice(currentBlock.text.length)
+        if (!textToEmit && fullText) {
+          const prevLen = currentBlock?.type === 'text' ? currentBlock.text.length : 0
+          if (fullText.length > prevLen) {
+            textToEmit = fullText.slice(prevLen)
           }
         }
 
