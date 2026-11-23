@@ -8,6 +8,8 @@ import {
   ROBIN_PROCESS_QUERY_METHOD,
   ROBIN_DEFAULT_USER_AGENT,
   ROBIN_API_CLIENT,
+  GeminiAppError,
+  type GeminiAppAccount,
   type GeminiAppConfig,
   type ProcessQueryRequest,
   type ProcessQueryResponse,
@@ -20,6 +22,9 @@ import {
 } from './proto.ts'
 import { parseRobinGrpcFramesToChunks } from './stream-mapper.ts'
 import { resolveGeminiAppToken, formatGeminiAppAuthGuidance } from './auth.ts'
+import type { GeminiAppPoolManager } from './pool.ts'
+
+export { GeminiAppError } from './types.ts'
 
 export interface GeminiAppTransportResult {
   frames: AsyncIterable<Uint8Array>
@@ -32,25 +37,6 @@ export type GeminiAppTransport = (
   body: Uint8Array,
   signal?: AbortSignal,
 ) => Promise<GeminiAppTransportResult>
-
-export class GeminiAppError extends Error {
-  public readonly code: string
-  public readonly httpStatus?: number
-  public readonly grpcStatus?: number
-
-  constructor(
-    message: string,
-    code: string,
-    httpStatus?: number,
-    grpcStatus?: number,
-  ) {
-    super(message)
-    this.name = 'GeminiAppError'
-    this.code = code
-    this.httpStatus = httpStatus
-    this.grpcStatus = grpcStatus
-  }
-}
 
 /**
  * Standard HTTP/2 gRPC transport connecting to robinfrontend-pa.googleapis.com.
@@ -223,36 +209,19 @@ export async function defaultHttp2Transport(
 export class GeminiAppClient {
   private readonly config: GeminiAppConfig
   private readonly transport: GeminiAppTransport
+  private readonly pool?: GeminiAppPoolManager
 
-  constructor(config: GeminiAppConfig = {}, transport: GeminiAppTransport = defaultHttp2Transport) {
+  constructor(
+    config: GeminiAppConfig = {},
+    transport: GeminiAppTransport = defaultHttp2Transport,
+    pool?: GeminiAppPoolManager,
+  ) {
     this.config = config
     this.transport = transport
+    this.pool = pool
   }
 
-  /**
-   * Primary streaming method: executes ProcessQuery gRPC call and streams StreamChunks.
-   */
-  async *streamProcessQuery(
-    request: ProcessQueryRequest,
-    signal?: AbortSignal,
-    onFirstEmit?: () => void,
-  ): AsyncGenerator<StreamChunk, void, unknown> {
-    const token = await resolveGeminiAppToken(this.config)
-    if (!token) {
-      yield {
-        type: 'finish',
-        reason: {
-          kind: 'error',
-          failure: {
-            code: 'AUTH_REQUIRED',
-            message: formatGeminiAppAuthGuidance(),
-          },
-        },
-      }
-      return
-    }
-
-    const endpoint = this.config.endpoint || ROBIN_DEFAULT_ENDPOINT
+  private buildGrpcPayload(request: ProcessQueryRequest): Uint8Array {
     const requestFrames = encodeProcessQueryFrames(request).map((frame) => encodeGrpcFrame(frame))
     const totalLen = requestFrames.reduce((sum, f) => sum + f.length, 0)
     const grpcPayload = new Uint8Array(totalLen)
@@ -261,7 +230,16 @@ export class GeminiAppClient {
       grpcPayload.set(f, offset)
       offset += f.length
     }
+    return grpcPayload
+  }
 
+  private async *executeWithToken(
+    token: string,
+    endpoint: string,
+    grpcPayload: Uint8Array,
+    signal?: AbortSignal,
+    onFirstEmit?: () => void,
+  ): AsyncGenerator<StreamChunk, void, unknown> {
     const headers: Record<string, string> = {
       'content-type': 'application/grpc',
       'grpc-accept-encoding': 'gzip',
@@ -290,6 +268,157 @@ export class GeminiAppClient {
     }
 
     yield* parseRobinGrpcFramesToChunks(transportResult.frames, signal, onFirstEmit)
+  }
+
+  /**
+   * Primary streaming method: executes ProcessQuery gRPC call and streams StreamChunks.
+   */
+  async *streamProcessQuery(
+    request: ProcessQueryRequest,
+    signal?: AbortSignal,
+    onFirstEmit?: () => void,
+  ): AsyncGenerator<StreamChunk, void, unknown> {
+    const endpoint = this.config.endpoint || ROBIN_DEFAULT_ENDPOINT
+    const grpcPayload = this.buildGrpcPayload(request)
+
+    if (this.pool && this.pool.listAccounts().length > 0) {
+      const totalAccounts = this.pool.listAccounts().length
+      const triedIds = new Set<string>()
+      let lastFailure: { code: string; message: string } | null = null
+
+      while (triedIds.size < totalAccounts) {
+        const selected = this.pool.selectAccount()
+        if (!selected || triedIds.has(selected.id)) {
+          break
+        }
+        triedIds.add(selected.id)
+
+        let account: GeminiAppAccount
+        try {
+          account = await this.pool.ensureValidToken(selected)
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err)
+          const code = err instanceof GeminiAppError ? err.code : 'AUTH_REQUIRED'
+          if (code === 'AUTH_REQUIRED') {
+            this.pool.markAuthRequired(selected.id, message)
+          } else {
+            this.pool.markCooldown(selected.id, message)
+          }
+          lastFailure = { code, message }
+          continue
+        }
+
+        let refreshedOnce = false
+        while (true) {
+          let hasEmittedContent = false
+          let retrySameAccount = false
+          let switchNextAccount = false
+
+          for await (const chunk of this.executeWithToken(
+            account.accessToken,
+            endpoint,
+            grpcPayload,
+            signal,
+            onFirstEmit,
+          )) {
+            if (chunk.type === 'content-block-start' || chunk.type === 'content-block-delta') {
+              hasEmittedContent = true
+              yield chunk
+              continue
+            }
+
+            if (chunk.type === 'finish') {
+              const reason = (chunk as {
+                reason?: { kind?: string; failure?: { message?: string; code?: string } }
+              }).reason
+              if (reason?.kind === 'stop') {
+                this.pool.markSuccess(account.id)
+                yield chunk
+                return
+              }
+              if (reason?.kind === 'aborted') {
+                yield chunk
+                return
+              }
+              if (reason?.kind === 'error') {
+                const code = reason.failure?.code || 'UNKNOWN_ERROR'
+                const message = reason.failure?.message || 'Gemini App request failed'
+
+                if (!hasEmittedContent && code === 'RATE_LIMIT') {
+                  this.pool.markCooldown(account.id, message)
+                  lastFailure = { code, message }
+                  switchNextAccount = true
+                  break
+                }
+
+                if (!hasEmittedContent && code === 'AUTH_REQUIRED') {
+                  if (!refreshedOnce && account.masterToken) {
+                    refreshedOnce = true
+                    try {
+                      account = await this.pool.forceRefreshAccount(account.id)
+                      retrySameAccount = true
+                      break
+                    } catch (refreshErr) {
+                      const refreshMsg =
+                        refreshErr instanceof Error ? refreshErr.message : String(refreshErr)
+                      lastFailure = { code: 'AUTH_REQUIRED', message: refreshMsg }
+                      switchNextAccount = true
+                      break
+                    }
+                  }
+                  this.pool.markAuthRequired(account.id, message)
+                  lastFailure = { code, message }
+                  switchNextAccount = true
+                  break
+                }
+
+                yield chunk
+                return
+              }
+            }
+
+            yield chunk
+          }
+
+          if (retrySameAccount) {
+            continue
+          }
+          if (switchNextAccount) {
+            break
+          }
+          return
+        }
+      }
+
+      yield {
+        type: 'finish',
+        reason: {
+          kind: 'error',
+          failure: lastFailure ?? {
+            code: 'RATE_LIMIT',
+            message: 'All Gemini App pool accounts are unavailable (cooldown or auth_required).',
+          },
+        },
+      }
+      return
+    }
+
+    const token = await resolveGeminiAppToken(this.config)
+    if (!token) {
+      yield {
+        type: 'finish',
+        reason: {
+          kind: 'error',
+          failure: {
+            code: 'AUTH_REQUIRED',
+            message: formatGeminiAppAuthGuidance(),
+          },
+        },
+      }
+      return
+    }
+
+    yield* this.executeWithToken(token, endpoint, grpcPayload, signal, onFirstEmit)
   }
 
   /**

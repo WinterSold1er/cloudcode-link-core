@@ -99,3 +99,60 @@ export interface GeminiAppConfig {
   timeZone?: string
   defaultModel?: string
 }
+
+export type GeminiAppAccountStatus = 'ready' | 'cooldown' | 'auth_required'
+
+export interface GeminiAppAccount {
+  id: string
+  email: string
+  accessToken: string
+  masterToken?: string
+  expiresAt?: number
+  status: GeminiAppAccountStatus
+  cooldownUntil?: number
+  lastUsedAt?: number
+  errorCount: number
+  lastError?: string
+}
+
+export interface GeminiAppPoolState {
+  version: number
+  accounts: GeminiAppAccount[]
+}
+
+export interface GeminiAppAccountSummary {
+  id: string
+  email: string
+  status: GeminiAppAccountStatus
+  hasMasterToken: boolean
+  expiresAt?: number
+  cooldownUntil?: number
+  lastUsedAt?: number
+  errorCount: number
+  lastError?: string
+}
+
+export interface GeminiAppPoolSummary {
+  total: number
+  ready: number
+  accounts: GeminiAppAccountSummary[]
+}
+
+export class GeminiAppError extends Error {
+  public readonly code: string
+  public readonly httpStatus?: number
+  public readonly grpcStatus?: number
+
+  constructor(
+    message: string,
+    code: string,
+    httpStatus?: number,
+    grpcStatus?: number,
+  ) {
+    super(message)
+    this.name = 'GeminiAppError'
+    this.code = code
+    this.httpStatus = httpStatus
+    this.grpcStatus = grpcStatus
+  }
+}
